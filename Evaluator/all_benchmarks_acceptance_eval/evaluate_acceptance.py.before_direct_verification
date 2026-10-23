@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""Evaluate frozen AcceptedLengthHead using DFlash training-block features.
+
+Uses the existing ArrowDataset hidden-state transport and DFlash backbone.
+No speculative serving loop, trace hook, or per-block disk cache is involved.
+"""
+import argparse
+import json
+import os
+import random
+import threading
+from datetime import timedelta
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+from acceptance_block_labels import cached_boundary, verified_boundary, eligible_starts
+
+
+def parse_args():
+    import torch
+    p = argparse.ArgumentParser(description='Frozen acceptance-head evaluation; no weight updates.')
+    p.add_argument('--checkpoint', required=True)
+    p.add_argument('--dataset', default='', help='Default: training dataset (NOT held out)')
+    p.add_argument('--output', required=True)
+    p.add_argument('--endpoint', required=True)
+    p.add_argument('--max-samples', type=int, default=2000, help='Random rows; 0 means all')
+    p.add_argument('--seed', type=int, default=20261021)
+    p.add_argument('--workers', type=int, default=2)
+    p.add_argument('--verify-workers', type=int, default=4)
+    p.add_argument('--audit-blocks', type=int, default=32)
+    args = p.parse_args()
+    saved = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
+    settings = saved['settings']
+    args.target = settings['target']
+    args.draft = settings['draft']
+    training_dataset = str(Path(settings['dataset']).resolve())
+    args.dataset = str(Path(args.dataset or training_dataset).resolve())
+    args.data_scope = ('training_dataset_resample_NOT_HELD_OUT' if args.dataset == training_dataset
+                       else 'external_dataset_overlap_NOT_VERIFIED')
+    for name, default in [('seq_len',8192),('anchors',256),('selector_chunk',8),
+                          ('head_batch',384),('request_timeout',180),('prefetch',2)]:
+        setattr(args,name,settings.get(name,default))
+    args.epochs = 1
+    args.log_every = 10
+    if min(args.max_samples,args.workers,args.audit_blocks) < 0 or args.verify_workers < 1:
+        p.error('Invalid sample/worker/audit count')
+    print('Evaluation data scope: '+args.data_scope,flush=True)
+    return args
+
+
+class CheckedRows:
+    """Validate actual sequence lengths before the existing packer can truncate."""
+    def __init__(self, dataset):
+        self.dataset = dataset
+    def __len__(self):
+        return len(self.dataset)
+    def __getitem__(self, index):
+        row = self.dataset[index]
+        if not isinstance(row, dict):
+            raise RuntimeError(f'Hidden-state fetch failed for row {index}: {row}')
+        actual = row['input_ids'].numel()
+        if actual != int(self.dataset.approx_lengths[index]):
+            raise ValueError(f'Row {index}: seq_len metadata differs from actual token count')
+        return row
+
+
+# Imports stay in main so spawned dataloader workers do not initialize an NPU.
+def main():
+    import torch
+    import torch_npu
+    from torch.utils.data import DataLoader
+    from torch.utils.tensorboard import SummaryWriter
+    from transformers import AutoConfig
+    from hs_connectors import FileTransfer
+    from speculators.config import VerifierConfig
+    from speculators.models.dflash_prefix.config import DFlashPrefixSpeculatorConfig
+    from speculators.models.dflash_prefix.core import DFlashPrefixDraftModel
+    from speculators.models.dflash_prefix.selector_v2 import unary_topk
+    from speculators.models.dflash_prefix.acceptance_features import build_acceptance_features, FEATURE_SCHEMA
+    from speculators.models.dflash_prefix.acceptance_head import AcceptedLengthHead
+    from speculators.models.dflash_prefix.acceptance_loss import acceptance_boundary_loss
+    from speculators.models.dflash_prefix.acceptance_collector import checkpoint_fingerprint
+    from speculators.train.data import ArrowDataset, CollateFn
+    from speculators.train.dataloader import _worker_init_fn, _limit_worker_threads
+    from speculators.train.distributed_batch_sampler import MultipackDistributedBatchSamplerV2
+    from speculators.utils.loading import list_checkpoint_keys
+
+    import torch.distributed as dist
+    args = parse_args()
+    if int(os.environ.get('WORLD_SIZE', '1')) != 1:
+        raise ValueError('Run evaluator with a single process, not torchrun')
+    rank = int(os.environ.get('RANK', '0'))
+    world = int(os.environ.get('WORLD_SIZE', '1'))
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    torch.npu.set_device(local_rank)
+    device = torch.device(f'npu:{local_rank}')
+    if world > 1:
+        dist.init_process_group('hccl', timeout=timedelta(minutes=30))
+    if args.head_batch % world:
+        raise ValueError('--head-batch is GLOBAL and must be divisible by worker count')
+    local_batch = args.head_batch // world
+
+    def reduce_values(values, maximum=False):
+        dtype = torch.int64 if all(isinstance(v, int) for v in values) else torch.float32
+        value = torch.tensor(values, dtype=dtype, device=device)
+        if world > 1:
+            dist.all_reduce(value, op=dist.ReduceOp.MAX if maximum else dist.ReduceOp.SUM)
+        return value.cpu().tolist()
+
+    out = Path(args.output).resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    if rank == 0: (out/'settings.json').write_text(json.dumps(dict(vars(args), world_size=world), indent=2))
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    _limit_worker_threads()
+    target_cfg = AutoConfig.from_pretrained(args.target, local_files_only=True)
+    target_cfg = getattr(target_cfg, 'text_config', target_cfg)
+    config = DFlashPrefixSpeculatorConfig.from_pretrained(args.draft, local_files_only=True)
+    if config.sample_from_anchor or config.draft_vocab_size != target_cfg.vocab_size:
+        raise ValueError('Requires full-vocabulary DFlash-Prefix with anchor excluded')
+    if config.prefix_selector_kind not in ('compiled_prefix_v3', 'local_prefix_v2'):
+        raise ValueError('This adapter supports compiled_prefix_v3 and local_prefix_v2')
+    if config.prefix_inference_gate_scale != 1 or getattr(config, 'prefix_disable_selector', False):
+        raise ValueError('Requires enabled selector with inference gate scale 1')
+    for key in ('hidden_size', 'vocab_size', 'rms_norm_eps'):
+        if getattr(config.transformer_layer_config, key) != getattr(target_cfg, key):
+            raise ValueError(f'Target/checkpoint mismatch: {key}')
+    config.transformer_layer_config.sliding_window = None
+    config.transformer_layer_config.use_sliding_window = False
+    config.transformer_layer_config.layer_types = ['full_attention'] * config.transformer_layer_config.num_hidden_layers
+    config.transformer_layer_config._attn_implementation = 'sdpa'
+    print(f'Rank {rank}/{world}: full attention, device={device}, seq_len={args.seq_len}, anchors={args.anchors}', flush=True)
+    config.speculators_config.verifier = VerifierConfig.from_pretrained(args.target, local_files_only=True)
+    if any(i < 0 or i > target_cfg.num_hidden_layers for i in config.aux_hidden_state_layer_ids):
+        raise ValueError('Invalid target hidden-state layer indices')
+
+    # Explicit anchors; all transformer/attention operations remain inherited.
+    class BlockDraft(DFlashPrefixDraftModel):
+        def _build_attention_mask(self, loss_mask, max_anchors, document_ids, device):
+            anchors = self.acceptance_anchors
+            if len(anchors) != max_anchors:
+                raise ValueError('Anchor-count mismatch')
+            if self.uses_sliding_window_attn:
+                raise ValueError('Full-attention checkpoint required; no attention policy is changed')
+            full = self._create_attention_mask(document_ids, loss_mask.shape[1], anchors, device)
+            return full, None, anchors, torch.ones_like(anchors, dtype=torch.bool)
+
+    print('Loading frozen draft checkpoint and matching verifier-owned weights...', flush=True)
+    draft = BlockDraft.from_pretrained(args.draft, config=config, verifier=args.target,
+                                      local_files_only=True, dtype='auto')
+    allowed_missing = {'embed_tokens.weight', 'lm_head.weight', 'verifier_lm_head.weight',
+                       'verifier_norm.weight', 't2d', 'd2t'}
+    stored = set(list_checkpoint_keys(Path(args.draft)))
+    expected = set(draft.state_dict())
+    if expected-stored-allowed_missing or stored-expected:
+        raise ValueError(f'Incomplete checkpoint: missing={sorted(expected-stored-allowed_missing)[:8]}, '
+                         f'unexpected={sorted(stored-expected)[:8]}')
+    draft.eval().requires_grad_(False)
+    draft.to(device)
+    if draft.uses_sliding_window_attn:
+        raise ValueError('This run requires the existing full-attention checkpoint')
+    if any(p.requires_grad for p in draft.parameters()):
+        raise RuntimeError('Frozen-draft assertion failed')
+    block = draft.block_size
+    k = block-1
+    hidden_size = config.transformer_layer_config.hidden_size
+    saved = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
+    architecture = saved['architecture']
+    if architecture['hidden_size'] != hidden_size or architecture['num_proposals'] != k:
+        raise ValueError('Head dimensions do not match draft')
+    head = AcceptedLengthHead(**architecture).float().to(device)
+    head.load_state_dict(saved['state_dict'], strict=True)
+    head.eval().requires_grad_(False)
+    eos = getattr(target_cfg, 'eos_token_id', None)
+    eos = [] if eos is None else [eos] if isinstance(eos, int) else list(eos)
+    print('Fingerprinting checkpoints for compatibility metadata...', flush=True)
+    identity = None
+    if rank == 0:
+        identity = dict(schema=FEATURE_SCHEMA, proposals=k,
+                        draft_sha256=checkpoint_fingerprint(args.draft),
+                        target_sha256=checkpoint_fingerprint(args.target),
+                        decoding='greedy_default_penalties_v1', eos_token_ids=sorted(eos),
+                        draft_attention='full_attention')
+    if world > 1:
+        objects = [identity]
+        dist.broadcast_object_list(objects, src=0, device=device)
+        identity = objects[0]
+    if rank == 0: (out/'identity.json').write_text(json.dumps(identity, indent=2))
+    step = packs = trained = visited_rows = 0
+    start_epoch = 0
+    if saved['identity'] != identity:
+        raise ValueError('Checkpoint feature schema, target or draft fingerprint mismatch')
+    print(f"Loaded frozen head: step={saved['step']}, training_blocks={saved['training_blocks']}", flush=True)
+
+    dataset = ArrowDataset(max_len=args.seq_len, datapath=args.dataset,
+                           transfer=FileTransfer(out/f'hidden_state_cache_rank{rank}'),
+                           vllm_endpoint=args.endpoint, on_missing='generate', on_generate='delete',
+                           train_ratio=1.0, split='train', hidden_states_dtype=torch.bfloat16,
+                           model=args.target, request_timeout=args.request_timeout, max_retries=2,
+                           generation_validation_retries=0)
+    dataset.data = dataset.data.with_format('torch')
+    source_row_count = len(dataset)
+    n = min(args.max_samples, source_row_count) if args.max_samples else source_row_count
+    selected_rows = sorted(random.Random(args.seed).sample(range(source_row_count), n))
+    dataset.data = dataset.data.select(selected_rows)
+    dataset.approx_lengths = [dataset.approx_lengths[i] for i in selected_rows]
+    (out/'selected_rows.json').write_text(json.dumps(selected_rows))
+    global_rows = len(dataset)
+    # Shard rows first, then pack each shard. No padding, duplicates, or dropped tails.
+    if global_rows < world:
+        raise ValueError('Need at least one dataset row per training worker')
+    shard_indices = range(rank, global_rows, world)
+    dataset.data = dataset.data.select(shard_indices)
+    dataset.approx_lengths = dataset.approx_lengths[rank::world]
+    if any(length > args.seq_len or length < 1 for length in dataset.approx_lengths):
+        raise ValueError('Dataset row exceeds token budget or is empty; refusing truncation')
+    sampler = MultipackDistributedBatchSamplerV2(args.seq_len, dataset.approx_lengths,
+                                                num_replicas=1, rank=0, seed=args.seed,
+                                                truncate_long_samples=False)
+    loader = DataLoader(CheckedRows(dataset), batch_sampler=sampler,
+                        collate_fn=CollateFn(args.seq_len, hidden_size,
+                                            num_target_layers=len(draft.target_layer_ids),
+                                            dtype=torch.bfloat16),
+                        num_workers=args.workers, pin_memory=False,
+                        prefetch_factor=args.prefetch if args.workers else None,
+                        persistent_workers=bool(args.workers),
+                        multiprocessing_context='spawn' if args.workers else None,
+                        worker_init_fn=_worker_init_fn if args.workers else None)
+
+    # Fallback verifier shares the exact hidden-state transport used by training.
+    # HTTP/CPU work is parallel; all NPU projection work stays on the main thread.
+    local = threading.local()
+    def fetch_verification(item):
+        import openai
+        from speculators.data_generation.vllm_client import generate_hidden_states
+        from speculators.data_generation.offline import check_hidden_states
+        index, tokens = item
+        if not hasattr(local, 'client'):
+            local.client = openai.OpenAI(base_url=args.endpoint, api_key='EMPTY', max_retries=0)
+            local.transfer = FileTransfer(out/f'verification_cache_rank{rank}')
+            local.transfer.setup()
+        handle = None
+        try:
+            handle = generate_hidden_states(local.client, args.target, {'input_ids': tokens},
+                                            timeout=args.request_timeout, max_retries=2)
+            value = local.transfer.get_generated(handle)
+            if value is None:
+                raise RuntimeError('No hidden states returned by fallback verification')
+            check_hidden_states(value, tokens)
+            # Prediction for proposal j uses the state BEFORE proposal j.
+            last = value['hidden_states'][-k-1:-1, -1].clone()
+            if last.shape != (k, hidden_size):
+                raise ValueError('Unexpected verification hidden-state shape')
+            return index, last
+        finally:
+            if handle is not None:
+                local.transfer.delete(handle)
+
+    @torch.no_grad()
+    def verify_items(items):
+        result = {}
+        # At most args.anchors small responses retained; never retain a dataset.
+        for index, states in pool.map(fetch_verification, items):
+            with torch.autocast(device_type='npu', dtype=torch.bfloat16):
+                logits = draft.verifier_lm_head(draft.verifier_norm(states.to(device)))
+            result[index] = logits.argmax(-1).cpu().tolist()
+        return result
+
+    class NullWriter:
+        def add_scalar(self, *a, **kw): pass
+        def flush(self): pass
+        def close(self): pass
+    writer = SummaryWriter(str(out/'tensorboard')) if rank == 0 else NullWriter()
+    metrics = {}
+    feature_queue, label_queue = [], []
+    queued = 0
+    audit_remaining = args.audit_blocks
+    run_start = time.monotonic()
+    pending_time = dict(fetch=0., draft=0., verification=0., head=0.)
+    total_fallback = total_blocks = eos_skipped = no_blocks = 0
+
+    def sync():
+        torch.npu.synchronize()
+
+    from eval_metrics import summarize
+    confusion = [[0]*(k+1) for _ in range(k+1)]
+    metric_sums = {}
+
+    @torch.no_grad()
+    def evaluate_queued(final=False):
+        nonlocal queued, feature_queue, label_queue, step, trained
+        if not queued or (queued < args.head_batch and not final):
+            return
+        x, y = torch.cat(feature_queue), torch.cat(label_queue)
+        for begin in range(0, len(y), args.head_batch):
+            labels = y[begin:begin+args.head_batch]
+            logits = head(x[begin:begin+args.head_batch])
+            if not torch.isfinite(logits).all():
+                raise RuntimeError('Nonfinite head logits')
+            _, stats = acceptance_boundary_loss(logits, labels, under_weight=3.,
+                                                over_weight=1., cost_weight=1., validate=True)
+            predictions = logits.argmax(-1)
+            for truth, prediction in zip(labels.cpu().tolist(), predictions.cpu().tolist()):
+                confusion[truth][prediction] += 1
+            for name, value in stats.items():
+                metric_sums[name] = metric_sums.get(name,0.) + float(value.cpu())*len(labels)
+            trained += len(labels)
+            step += 1
+        feature_queue, label_queue, queued = [], [], 0
+        if any(p.grad is not None or p.requires_grad for p in head.parameters()):
+            raise RuntimeError('Evaluation head must remain frozen')
+
+    def finish_report():
+        import csv
+        report = summarize(confusion)
+        report.update(checkpoint=str(Path(args.checkpoint).resolve()), data_scope=args.data_scope,
+                      dataset=args.dataset, source_rows=source_row_count, evaluated_rows=visited_rows,
+                      candidate_blocks=total_blocks, eos_skipped=eos_skipped,
+                      fallback_blocks=total_fallback, seed=args.seed,
+                      label_definition='greedy accepted proposals, excluding anchor/bonus; EOS blocks excluded',
+                      audit_blocks_checked=args.audit_blocks-audit_remaining,
+                      loss_metrics={name:value/trained for name,value in metric_sums.items()})
+        (out/'metrics.json').write_text(json.dumps(report,indent=2))
+        with (out/'confusion_matrix.csv').open('w',newline='') as f:
+            w=csv.writer(f); w.writerow(['true/predicted']+list(range(k+1)))
+            for truth,row in enumerate(confusion): w.writerow([truth]+row)
+        with (out/'per_length.csv').open('w',newline='') as f:
+            w=csv.writer(f); w.writerow(['true_length','count','exact_accuracy'])
+            for truth,row in enumerate(confusion):
+                w.writerow([truth,sum(row),row[truth]/sum(row) if sum(row) else ''])
+        print(json.dumps(report,indent=2),flush=True)
+        print(f'Finished evaluation: {out}/metrics.json',flush=True)
+
+    print(f'Evaluating {len(dataset):,} dataset rows per epoch; {args.anchors} block positions per pack; '
+          f'global head batch={args.head_batch}; rank={rank}; no full-response generation.', flush=True)
+    try:
+        with ThreadPoolExecutor(max_workers=args.verify_workers) as pool:
+            for epoch in range(start_epoch, args.epochs):
+                sampler.set_epoch(epoch)
+                rng = random.Random(args.seed+epoch*world+rank)
+                iterator = iter(loader)
+                rows_this_epoch = 0
+                while True:
+                    begin = time.monotonic()
+                    try: batch = next(iterator)
+                    except StopIteration: batch = None
+                    active = int(reduce_values([int(batch is not None)])[0])
+                    if active == 0: break
+                    if batch is None:
+                        evaluate_queued()
+                        continue
+                    pending_time['fetch'] += time.monotonic()-begin
+                    if batch.get('error_records',0):
+                        raise RuntimeError('Hidden-state loader dropped a row; refusing silent incomplete training')
+                    docs_cpu = batch['document_ids'][0].tolist()
+                    mask_cpu = batch['loss_mask'][0].tolist()
+                    ids_cpu = batch['input_ids'][0].tolist()
+                    n_rows = len(set(d for d in docs_cpu if d >= 0))
+                    visited_rows += n_rows
+                    rows_this_epoch += n_rows
+                    packs += 1
+                    starts = eligible_starts(mask_cpu, docs_cpu, block)
+                    if not starts:
+                        no_blocks += 1
+                        print(f'Pack {packs}: no complete assistant blocks; rows visited={visited_rows}', flush=True)
+                        evaluate_queued()
+                        continue
+                    anchors_cpu = sorted(rng.sample(starts,min(args.anchors,len(starts))))
+                    tensors = {name:batch[name].to(device) for name in
+                               ('hidden_states','input_ids','loss_mask','verifier_last_hidden_states',
+                                'document_ids','position_ids')}
+                    draft.acceptance_anchors = torch.tensor(anchors_cpu,device=device,dtype=torch.long)
+                    begin = time.monotonic()
+                    with torch.no_grad(), torch.autocast(device_type='npu',dtype=torch.bfloat16):
+                        h,u,target,aligned,indices = draft._backbone_forward(**tensors,max_anchors=len(anchors_cpu))
+                        n = len(anchors_cpu)
+                        hidden = h.reshape(n,block,-1)[:,1:]
+                        unary = u.reshape(n,block,-1)[:,1:]
+                        cached_ids = target.reshape(n,block,-1)[:,1:].argmax(-1).cpu().tolist()
+                        block_ids = tensors['input_ids'][0,indices].reshape(n,block)
+                        reference = block_ids[:,1:].cpu().tolist()
+                        candidate_logits,candidates = unary_topk(unary,config.prefix_top_k)
+                        del target,u,unary
+                        pieces, choices = [],[]
+                        for start in range(0,n,args.selector_chunk):
+                            sl=slice(start,start+args.selector_chunk)
+                            tables = draft.prefix_head.prepare_tables(hidden[sl],candidates[sl],candidate_logits[sl],
+                                                                     block_ids[sl,0],**draft._prefix_kwargs())
+                            selected,scores = draft.prefix_head.walk(tables,return_scores=True)
+                            pieces.append(build_acceptance_features(hidden[sl],candidates[sl],candidate_logits[sl],
+                                                                    selected,scores,validate=True))
+                            choices.extend(selected.cpu().tolist())
+                        features=torch.cat(pieces).detach()
+                    del h, hidden, candidates, candidate_logits, tables, scores, selected, pieces, block_ids, tensors
+                    sync()
+                    pending_time['draft'] += time.monotonic()-begin
+                    total_blocks += n
+                    labels, statuses = [],[]
+                    for chosen,ref,tgt in zip(choices,reference,cached_ids):
+                        length,status=cached_boundary(chosen,ref,tgt,eos)
+                        labels.append(length); statuses.append(status)
+                    fallback=[i for i,s in enumerate(statuses) if s=='verify']
+                    total_fallback += len(fallback)
+                    audit=[i for i,s in enumerate(statuses) if s=='exact'][:audit_remaining]
+                    items=[]
+                    for i in fallback+audit:
+                        a=anchors_cpu[i]
+                        document=docs_cpu[a]
+                        first=a
+                        while first>0 and docs_cpu[first-1]==document: first-=1
+                        tokens=ids_cpu[first:a+1]+choices[i]
+                        items.append((i,tokens))
+                    begin=time.monotonic()
+                    verified=verify_items(items) if items else {}
+                    for i in fallback:
+                        labels[i],statuses[i]=verified_boundary(choices[i],verified[i],eos)
+                    for i in audit:
+                        actual,status=verified_boundary(choices[i],verified[i],eos)
+                        if (actual,status)!=(labels[i],statuses[i]):
+                            raise RuntimeError(f'Cached-label audit failed at pack {packs}, block {i}: '
+                                               f'cached={(labels[i],statuses[i])}, verified={(actual,status)}. '
+                                               'Investigate target numeric/transport alignment; no approximate labels used.')
+                    audit_remaining -= len(audit)
+                    sync()
+                    pending_time['verification'] += time.monotonic()-begin
+                    keep=[i for i,s in enumerate(statuses) if s=='exact']
+                    eos_skipped += sum(s=='eos' for s in statuses)
+                    if keep:
+                        feature_queue.append(features[keep].detach())
+                        label_queue.append(torch.tensor([labels[i] for i in keep],dtype=torch.long,device=device))
+                        queued += len(keep)
+                    evaluate_queued()
+                    if packs==1 or packs%args.log_every==0:
+                        print(f'rank={rank} epoch={epoch+1} rows={rows_this_epoch}/{len(dataset)} '
+                              f'pack={packs} blocks={n} fallback={len(fallback)} '
+                              f'evaluated_blocks={trained} queued={queued}',flush=True)
+                if rows_this_epoch!=len(dataset):
+                    raise RuntimeError(f'Expected every row once: saw {rows_this_epoch}, expected {len(dataset)}')
+                evaluate_queued(final=True)
+                if not trained: raise RuntimeError('No eligible evaluation blocks found')
+            finish_report()
+    finally:
+        writer.close()
+        if world > 1: dist.destroy_process_group()
+
+
+if __name__=='__main__':
+    main()

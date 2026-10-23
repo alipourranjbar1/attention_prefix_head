@@ -1,0 +1,137 @@
+"""Read benchmark records directly from local Arrow files; no Hub requests."""
+import argparse
+import json
+from pathlib import Path
+
+NAMES=('gsm8k','math500','humaneval','mbpp','lcb','aime25','mtbench','alpaca')
+PATTERNS={
+ 'gsm8k':'openai___gsm8k/main/*/*/gsm8k-test.arrow',
+ 'math500':'HuggingFaceH4___math-500/default/*/*/math-500-test.arrow',
+ 'humaneval':'openai___openai_humaneval/openai_humaneval/*/*/openai_humaneval-test.arrow',
+ 'mbpp':'google-research-datasets___mbpp/sanitized/*/*/mbpp-test.arrow',
+ 'aime25':'MathArena___aime_2025/default/*/*/aime_2025-train.arrow',
+ 'mtbench':'HuggingFaceH4___mt_bench_prompts/default/*/*/mt_bench_prompts-train.arrow',
+ 'alpaca':'tatsu-lab___alpaca/default/*/*/alpaca-train.arrow'}
+
+
+def read_source(source):
+    from datasets import Dataset, concatenate_datasets, load_from_disk
+    if source['kind']=='saved_dataset':
+        ds=load_from_disk(source['path'])
+        if not hasattr(ds,'column_names') or isinstance(ds.column_names,dict):
+            raise ValueError('LCB path must identify a Dataset, not a DatasetDict; use its split subdirectory')
+        return ds
+    return concatenate_datasets([Dataset.from_file(f) for f in source['files']])
+
+
+def arrow_files(folder):
+    # Exclude transformation/index cache files; only underlying dataset shards.
+    files=sorted(f for f in folder.glob('*.arrow') if not f.name.startswith('cache-'))
+    tests=[f for f in files if '-test' in f.name]
+    trains=[f for f in files if '-train' in f.name]
+    return tests or trains or files
+
+
+def lcb_source(cache, explicit=''):
+    if explicit:
+        path=Path(explicit).expanduser().resolve()
+        if path.is_file() and path.suffix=='.arrow': return dict(kind='arrow',files=[str(path)])
+        if path.is_dir() and (path/'state.json').exists(): return dict(kind='saved_dataset',path=str(path))
+        files=arrow_files(path) if path.is_dir() else []
+        if files: return dict(kind='arrow',files=list(map(str,files)))
+        raise ValueError('EVAL_LCB_PATH must point to an Arrow file, raw Arrow shard folder, or saved Dataset')
+    candidates=[]
+    for info in cache.glob('**/dataset_info.json'):
+        try: meta=json.loads(info.read_text())
+        except (OSError,ValueError): continue
+        keys=set(meta.get('features',{}))
+        # LiveCodeBench code-generation records have these source fields.
+        if not {'question_content','question_id'}.issubset(keys): continue
+        if not ({'public_test_cases','starter_code','platform'} & keys): continue
+        files=arrow_files(info.parent)
+        if not files: continue
+        candidates.append((max(f.stat().st_mtime for f in files),info.parent,files))
+    # Different cached revisions of the SAME builder/config are equivalent candidates;
+    # different builder/config selections require an explicit choice.
+    groups={}
+    for candidate in candidates:
+        key=str(candidate[1].parent.parent)
+        if key not in groups or candidate[0]>groups[key][0]: groups[key]=candidate
+    if len(groups)!=1:
+        paths='\n'.join(str(x[1]) for x in sorted(groups.values(),reverse=True)) or '(no matching schema found)'
+        raise ValueError('Cannot uniquely identify the cached LiveCodeBench code-generation dataset.\n'
+                         +paths+'\nSet EVAL_LCB_PATH to the correct local Arrow file/shard folder and rerun.')
+    _,folder,files=next(iter(groups.values()))
+    return dict(kind='arrow',files=list(map(str,files)),discovery='LiveCodeBench column schema',cache_folder=str(folder))
+
+
+def text(row,*keys):
+    for key in keys:
+        value=row.get(key)
+        if isinstance(value,str) and value.strip(): return value
+    raise ValueError('Missing nonempty prompt field: '+str(keys)+'; columns='+str(list(row)))
+
+
+def make_prompt(name,row,index):
+    task=str(row.get('task_id',row.get('question_id',row.get('id',f'{name}/{index}'))))
+    if name=='humaneval':
+        prompt='Complete the following Python function. Return only the completed Python code.\n\n'+text(row,'prompt')
+    elif name=='gsm8k': prompt=text(row,'question')+'\n\nSolve the problem and give the final answer.'
+    elif name=='math500': prompt=text(row,'problem')+'\n\nSolve the problem and give the final answer.'
+    elif name=='aime25': prompt=text(row,'problem','Problem','question','Question')+'\n\nSolve the problem and give the final answer.'
+    elif name=='mbpp': prompt='Write Python code for the following task. Return the code.\n\n'+text(row,'prompt','text')
+    elif name=='lcb':
+        prompt='Solve the following programming problem in Python. Return the solution code.\n\n'+text(row,'question_content')
+        starter=row.get('starter_code')
+        if isinstance(starter,str) and starter.strip(): prompt+='\n\nStarter code:\n'+starter
+    elif name=='mtbench':
+        turns=row.get('turns',row.get('prompt'))
+        if isinstance(turns,list) and turns and isinstance(turns[0],str): prompt=turns[0]
+        elif isinstance(turns,str) and turns.strip(): prompt=turns
+        else: raise ValueError('MT-Bench requires turns or prompt; found '+str(list(row)))
+    elif name=='alpaca':
+        prompt=text(row,'instruction')
+        context=row.get('input','')
+        if isinstance(context,str) and context.strip(): prompt+='\n\n'+context
+    else: raise ValueError('Unsupported benchmark '+name)
+    return task,prompt
+
+
+def build_manifest(cache,names,limit=128,all_rows=False,lcb_path=''):
+    cache=Path(cache).expanduser().resolve()
+    manifest=dict(cache_root=str(cache),selection='all_rows' if all_rows else 'first_N',benchmarks={})
+    failures=[]
+    for name in names:
+        try:
+            if name not in NAMES: raise ValueError('Unknown benchmark '+name)
+            if name=='lcb': source=lcb_source(cache,lcb_path)
+            else:
+                files=list(cache.glob(PATTERNS[name]))
+                if not files: raise FileNotFoundError('No cache matching '+str(cache/PATTERNS[name]))
+                selected=max(files,key=lambda f:f.stat().st_mtime)
+                source=dict(kind='arrow',files=[str(selected)])
+            ds=read_source(source)
+            cap=0 if all_rows or name in ('humaneval','aime25','mtbench') else limit
+            count=min(len(ds),cap) if cap else len(ds)
+            if not count: raise ValueError('Empty source')
+            for index,row in enumerate(ds.select(range(count))): make_prompt(name,row,index)
+            manifest['benchmarks'][name]=dict(source=source,source_rows=len(ds),selected_rows=count,
+                columns=ds.column_names,mtbench_turn_policy='first_turn_only' if name=='mtbench' else None)
+            print(f'{name}: {count}/{len(ds)} rows; columns={ds.column_names}',flush=True)
+        except Exception as error:
+            failures.append(f'{name}: {error}')
+    if failures: raise ValueError('Preflight failed before server startup:\n'+'\n'.join(failures))
+    return manifest
+
+if __name__=='__main__':
+    p=argparse.ArgumentParser()
+    p.add_argument('--cache-root',default='/home/n84449292/.cache/huggingface/datasets')
+    p.add_argument('--benchmarks',nargs='+',default=list(NAMES))
+    p.add_argument('--limit',type=int,default=128)
+    p.add_argument('--all-rows',action='store_true')
+    p.add_argument('--lcb-path',default='')
+    p.add_argument('--output',required=True)
+    a=p.parse_args()
+    if a.limit<1: p.error('--limit must be positive; use --all-rows for unlimited')
+    result=build_manifest(a.cache_root,a.benchmarks,a.limit,a.all_rows,a.lcb_path)
+    Path(a.output).write_text(json.dumps(result,indent=2))

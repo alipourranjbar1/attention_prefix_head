@@ -15,7 +15,7 @@ PYTHON_BIN="${PYTHON_BIN:-$ENV_ROOT/bin/python}"
 CANN_ROOT="${CANN_ROOT:-/home/n84449292/m84379596/CANN/9.1.0}"
 TARGET_MODEL="${TARGET_MODEL:-/home/n84449292/m84379596/Huggingface/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c}"
 SPECULATIVE_METHOD="${SPECULATIVE_METHOD:-dflash}"  # dflash | dspark | auto
-DRAFT_MODEL="${DRAFT_MODEL:-${DRAFT:-$SPEC_MAIN/output/dflash_qwen3_4b_openperfectblend_bs16/checkpoints/4}}"
+DRAFT_MODEL="${DRAFT_MODEL:-/home/n84449292/m84379596/DFlash/vLLM_NPU_spec_main/output/dflash_qwen3_4b_openperfectblend_bs16/checkpoints/4}"
 NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-15}"  # 7 for block-8 DFlash/Prefix; 15 for block-16
 # Prefix:  DRAFT_MODEL="$SPEC_MAIN/output/dflash_prefix_compiled_joint_bs16/joint_memory_fast_20261009_041643/checkpoints/4"
 # DSpark:  SPECULATIVE_METHOD=dspark
@@ -24,7 +24,7 @@ NUM_SPECULATIVE_TOKENS="${NUM_SPECULATIVE_TOKENS:-15}"  # 7 for block-8 DFlash/P
 # ============================================================
 # Execution and server settings
 # ============================================================
-NPU="${NPU:-6}"
+NPU="${NPU:-7}"
 PORT="${PORT:-8213}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-qwen3-4b-$SPECULATIVE_METHOD}"
 TARGET_EXECUTION="${TARGET_EXECUTION:-graph}"  # graph | eager
@@ -71,7 +71,11 @@ export NO_PROXY="localhost,127.0.0.1,::1" no_proxy="localhost,127.0.0.1,::1"
 # writes the exact vLLM command + log + evaluator record, then starts vLLM.
 # Graph mode removes target --enforce-eager; the speculative field stays true
 # for ALL three draft backbones. Learned head graphs are separate.
-exec "$PYTHON_BIN" "$SPEC_MAIN/speculators/scripts/dflash_prefix_compiled/target_graph_server.py" \
+ACCEPTANCE_ARGS=()
+if [[ -n "${ACCEPTANCE_CONFIG:-}" ]]; then
+    ACCEPTANCE_ARGS=(--acceptance-config "$ACCEPTANCE_CONFIG")
+fi
+exec "$PYTHON_BIN" "$SPEC_MAIN/speculators/scripts/dflash_prefix_compiled/target_graph_server.py" "${ACCEPTANCE_ARGS[@]}" \
     --spec-main "$SPEC_MAIN" --target "$TARGET_MODEL" --draft "$DRAFT_MODEL" \
     --speculative-method "$SPECULATIVE_METHOD" --num-speculative-tokens "$NUM_SPECULATIVE_TOKENS" \
     --target-execution "$TARGET_EXECUTION" --draft-enforce-eager "$DRAFT_ENFORCE_EAGER" \

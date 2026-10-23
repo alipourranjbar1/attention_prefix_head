@@ -27,11 +27,11 @@ PREFIX_PARITY_PASS ... mode=fast npu_graph=True; steady-state fast path enabled
 cd /home/n84449292/m84379596/DFlash/vLLM_NPU_spec_main/Evaluator
 
 python evaluator.py \
-  --base-url http://127.0.0.1:8213 \
-  --model qwen3-4b-spec \
-  --datasets gsm8k \
+  --base-url http://127.0.0.1:8216 \
+  --model qwen3-4b-prefix-dflash \
+  --datasets all \
   --manifest ./retrace_eval_prompts_all_v2.json \
-  --num-prompts 128 \
+  --num-prompts 2000 \
   --temperatures 0 \
   --concurrencies 1 \
   --top-p 1.0 \
@@ -43,7 +43,7 @@ python evaluator.py \
   --selector-warmup-tokens 512 \
   --selector-warmup-steps 32 \
   --no-thinking \
-  --output "results/spec_compare_$(date +%Y%m%d_%H%M%S)"
+  --output "results/prefix_dflash_ep6_bs16_layer1_full"
 
 
 ## --rebuild-manifest

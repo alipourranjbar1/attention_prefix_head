@@ -1,0 +1,219 @@
+# regenerate-responses
+
+Regenerates assistant responses in existing datasets using a vLLM-served model. Given a dataset containing conversations (e.g., Magpie, UltraChat, GSM8K), this pipeline extracts conversation turns, regenerates each assistant response turn-by-turn against the model's own prior outputs, and produces speculator-format training samples. For multi-turn conversations, each turn conditions on the regenerated history, producing on-policy training data.
+
+The pipeline consists of two entry points:
+
+| Entry point                        | Purpose                                                        |
+| ---------------------------------- | -------------------------------------------------------------- |
+| `run_all.sh`                       | End-to-end pipeline: starts vLLM, regenerates responses, stops |
+| `speculators regenerate-responses` | Standalone response regeneration against a running vLLM server |
+
+## run_all.sh
+
+Orchestrates the entire pipeline: starts a vLLM server (with optional data/tensor parallelism), regenerates responses for the dataset, and stops the server. Uses vLLM's built-in data parallelism (`--data-parallel-size`) for multi-GPU scaling with automatic load balancing.
+
+### Basic Usage
+
+```bash
+./scripts/response_regeneration/run_all.sh \
+  --model "meta-llama/Llama-3.3-70B-Instruct" \
+  --dataset magpie
+```
+
+### Arguments
+
+- **`--model`** (str, required) Model to serve and use for generation.
+
+- **`--gpus`** (str, default: all visible) Comma-separated GPU IDs (sets `CUDA_VISIBLE_DEVICES`).
+
+- **`--port`** (int, default: `8000`) Server port.
+
+- **`--dp-size`** (int) Number of data parallel replicas (maps to vLLM's `--data-parallel-size`).
+
+- **`--tp-size`** (int) Tensor parallel size per replica (maps to vLLM's `--tensor-parallel-size`).
+
+- **`--max-model-len`** (int) Maximum model context length (passed to `vllm serve --max-model-len`).
+
+- **`--reasoning-parser`** (str) Reasoning parser for the vLLM server (passed to `vllm serve --reasoning-parser`).
+
+- **`--keep-server`** (flag) Don't stop the vLLM server after processing completes.
+
+- **`--tool-call-parser`** (str) vLLM tool-call parser (e.g. `hermes`, `llama3_json`). Adds `--enable-auto-tool-choice --tool-call-parser` to the server; required for tool-call regeneration, otherwise tool calls arrive as raw text and are not regenerated as tools.
+
+All other arguments are passed through to the regeneration command (see `speculators regenerate-responses`).
+
+### Full Example
+
+```bash
+./scripts/response_regeneration/run_all.sh \
+  --model "meta-llama/Llama-3.3-70B-Instruct" \
+  --dp-size 4 --tp-size 2 \
+  --dataset magpie \
+  --limit 1000 \
+  --concurrency 128 \
+  --max-tokens 4096
+```
+
+## speculators regenerate-responses
+
+Extracts conversation turns from a dataset, regenerates each assistant response turn-by-turn via a vLLM chat completion endpoint, and writes out speculator-format training samples with generation boundaries marked in the loss mask.
+
+### Features
+
+- **Multi-turn support** — detects `messages`/`conversations` fields and regenerates each assistant turn against the model's own prior responses
+- **Local file support** for JSON/JSONL prompt datasets
+- **Auto-detects model** from vLLM server (no need to specify `--model`)
+- **Resume capability** to skip already-processed conversations
+- **Async processing** with configurable concurrency
+- **Automatic retries** with exponential backoff on transient failures
+
+### Basic Usage
+
+```bash
+speculators regenerate-responses --dataset magpie
+```
+
+### Local Files
+
+Pass a local `.json` or `.jsonl` file to `--dataset` to regenerate its responses. **JSONL is recommended for large datasets** because it can be read one row at a time; a regular JSON file may need to be loaded completely before iteration. Each JSONL line, or each object in a top-level JSON array, must use one of these schemas:
+
+- `prompt`: a non-empty string or a non-empty list of message objects.
+- `messages`: a non-empty list of message objects.
+- `conversations`: a non-empty list of message objects.
+
+Message objects may use OpenAI-style `role`/`content` keys or ShareGPT-style `from`/`value` keys. The recognized input roles are `system`, `user`, and `human`; `human` is normalized to `user`. Existing `assistant`/`gpt` turns are discarded and regenerated. `tool` messages are retained as cached results for tool-call regeneration.
+
+For example, `my_prompts.jsonl` may contain:
+
+```jsonl
+{"id":"prompt-1","prompt":"Explain speculative decoding."}
+{"id":"prompt-2","messages":[{"role":"system","content":"Be concise."},{"role":"user","content":"What is EAGLE?"}]}
+{"id":"prompt-3","conversations":[{"from":"human","value":"Compare EAGLE and DFlash."}]}
+```
+
+Run regeneration with:
+
+```bash
+speculators regenerate-responses \
+  --dataset ./my_prompts.jsonl
+```
+
+Column names such as `instruction`, `question`, and `text` are not inferred. Convert those rows to one of the schemas above or use a registered dataset preset with a normalization function.
+
+### Arguments
+
+#### Data Arguments
+
+- **`--dataset`** (str, default: `ultrachat`) Registered dataset preset (see [Supported Datasets](#supported-datasets)) or local JSON/JSONL file (see [Local Files](#local-files)). `--split` and `--subset` do not apply to local files.
+
+- **`--split`** (str, default: preset-specific) Dataset split. Defaults to the preset's split.
+
+- **`--subset`** (str, default: preset-specific) Dataset subset/config name. Defaults to the preset's subset.
+
+- **`--limit`** (int, default: `None`) Stop after N rows.
+
+- **`--language-filter`** (str, default: `None`) Only process rows where language matches this value (e.g., `EN`).
+
+#### Server Arguments
+
+- **`--endpoint`** (str, default: `http://127.0.0.1:8000/v1/chat/completions`) vLLM chat completions endpoint.
+
+- **`--model`** (str, default: `None`) Model name exposed by vLLM. Auto-detected from the server if not specified.
+
+#### Generation Arguments
+
+- **`--concurrency`** (int, default: `64`) Max concurrent requests to the vLLM server.
+
+- **`--max-tokens`** (int, default: `8192`) Max tokens for generation.
+
+- **`--sampling-params`** (str, default: `None`) JSON object merged into each chat-completion request, e.g. `'{"temperature": 0.6, "top_p": 0.95, "seed": 0}'`. Unset keys use the server defaults.
+
+- **`--max-retries`** (int, default: `3`) Max retry attempts per request on transient HTTP failures (408, 409, 425, 429, 5xx) with exponential backoff. Permanent errors (e.g., 400, 404) fail immediately.
+
+#### Output Arguments
+
+- **`--outfile`** (str, default: auto-generated) Output JSONL path. If not specified, auto-generated as `{dataset-or-file-stem}_{model}.jsonl`.
+
+- **`--resume`** (flag) Skip conversations already present in the output file (matched by `primary_id`: the row's `id`/`uuid` if it has one, otherwise a content hash).
+
+### Full Example
+
+```bash
+speculators regenerate-responses \
+  --dataset magpie \
+  --endpoint http://127.0.0.1:8000/v1/chat/completions \
+  --limit 1000 \
+  --concurrency 128 \
+  --max-tokens 4096 \
+  --outfile magpie_Llama-3.3-70B-Instruct.jsonl \
+  --resume
+```
+
+## Supported Datasets
+
+The text presets from the shared dataset registry (`DATASET_CONFIGS` in `speculators/data_generation/configs.py`) — the same ones `prepare-data` accepts:
+
+| Dataset             | HuggingFace ID                                    | Default Split |
+| ------------------- | ------------------------------------------------- | ------------- |
+| `sharegpt`          | `Aeala/ShareGPT_Vicuna_unfiltered`                | `train`       |
+| `ultrachat`         | `HuggingFaceH4/ultrachat_200k`                    | `train_sft`   |
+| `gsm8k`             | `openai/gsm8k`                                    | `train`       |
+| `magpie`            | `Magpie-Align/Magpie-Llama-3.1-Pro-300K-Filtered` | `train`       |
+| `nemotron`          | `nvidia/Llama-Nemotron-Post-Training-Dataset`     | `chat`        |
+| `open-perfectblend` | `mlabonne/open-perfectblend`                      | `train`       |
+| `hermes-fc`         | `NousResearch/hermes-function-calling-v1`         | `train`       |
+
+The registry's multimodal preset, `sharegpt4v_coco`, is rejected because this regeneration pipeline cannot send its image content or retain it in a speculator-format row. Generate target responses with a multimodal-capable workflow, save the resulting natural-language conversations, and convert them with `speculators prepare-data`.
+
+## Output Format
+
+Rows are in speculator format and ready for training: one row per target generation, holding the prompt the target conditioned on followed by the tokens it generated. The endpoint must support `return_token_ids`, which the script uses to read the generation boundary directly instead of re-tokenizing the text and recovering the boundary with a regex.
+
+```json
+{
+  "id": "conv-abc_gen0",
+  "primary_id": "conv-abc",
+  "input_ids": [151644, 872, ...],
+  "loss_mask": [0, 0, ..., 1, 1],
+  "text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\nThe capital of France is Paris.<|im_end|>",
+  "metadata": {
+    "idx": 0,
+    "finish_reason": "stop",
+    "is_tool_call": false,
+    "usage": {...},
+    "endpoint": "http://127.0.0.1:8000/v1/chat/completions",
+    "sampling_params": {...}
+  }
+}
+```
+
+- `loss_mask` is `0` over the prompt and `1` over the generated tokens. This *is* the generation boundary, so training applies no further masking.
+- A conversation yields one row per target generation, each carrying the history before it. Generation `k`'s row is `{primary_id}_gen{k}`. A plain assistant turn is one generation; a turn that calls a tool is two or more (see [Tool calls](#tool-calls)).
+- `primary_id` is the conversation's stable id, used by `--resume`. The row `id` is generation-suffixed and never matches it.
+- `is_tool_call` marks a row whose generated tokens are a tool call rather than a final answer.
+- `text` is a human-readable decode of `input_ids` (`tokenizer.decode`, special tokens kept) for review only — faithful to the tokens by construction. Training drops it.
+
+Rows are written only once a conversation finishes. A conversation that fails partway writes nothing to the output file and one row to a sibling error file instead (`--outfile out.jsonl` gives `out.errors.jsonl`), so `--resume` retries it whole:
+
+```json
+{
+  "id": "conv-abc",
+  "metadata": {
+    "idx": 0,
+    "error": "ConnectionError(...)",
+    "generations_completed": 1,
+    "endpoint": "http://127.0.0.1:8000/v1/chat/completions"
+  }
+}
+```
+
+### Tool calls
+
+If a source row carries a `tools` schema, it is forwarded to the endpoint on every request and the target regenerates its own tool calls, which are supervised like any other generation.
+
+Tools are **not executed**. The target's *k*-th regenerated call is paired with the *k*-th cached tool result already present in the source row, spliced back as a `tool` message so the conversation can continue. Tool results are environment observations rather than policy outputs; all assistant and tool-call tokens are generated by the target model.
+
+A conversation stops early — keeping the rows completed so far — when the target emits a call that cannot be paired 1:1 with a cached result: it has exhausted the cached results, emitted parallel calls in a single generation, or called a different tool than the next cached result answers. Such conversations are counted under `truncated` in the progress bar.
+
+If `--outfile` is not specified, the filename is auto-generated from the preset name or local file stem and model (e.g., `magpie_Llama-3.3-70B-Instruct.jsonl`).
