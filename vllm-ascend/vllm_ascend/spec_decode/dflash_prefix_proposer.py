@@ -124,6 +124,42 @@ class AscendDflashPrefixProposer(AscendDflashProposer):
         self.acceptance_pending_features = None
         self.acceptance_pending_tokens = None
 
+        self.linear_confidence = None
+        confidence_path = envs.VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_HEAD
+        if confidence_path:
+            scheduler = vllm_config.scheduler_config
+            parallel = vllm_config.parallel_config
+            if (cfg.get("prefix_selector_kind") not in {"compiled_prefix_v3", "local_prefix_v2"}
+                    or self._prefix_disable_selector
+                    or scheduler.async_scheduling
+                    or not spec.enforce_eager
+                    or (parallel.tensor_parallel_size, parallel.pipeline_parallel_size,
+                        parallel.data_parallel_size) != (1, 1, 1)):
+                raise ValueError("Linear confidence requires compiled_prefix_v3 or local_prefix_v2, enabled "
+                                 "selector, eager draft, synchronous scheduling, TP=PP=DP=1")
+            if (envs.VLLM_ASCEND_PREFIX_ACCEPTANCE_TRACE_DIR
+                    or envs.VLLM_ASCEND_PREFIX_ACCEPTANCE_CONFIG):
+                raise ValueError("Do not combine linear confidence with acceptance collection/config")
+            if scheduler.max_num_seqs > 1 and (
+                not vllm_config.model_config.enforce_eager
+                or self._prefix_inference_mode != "reference"
+                or os.environ.get("DFLASH_PREFIX_NPU_GRAPH", "0") != "0"
+            ):
+                raise ValueError("Batched linear confidence requires eager target and reference selector, no graphs")
+            if spec.disable_padded_drafter_batch:
+                raise ValueError("Linear confidence requires padded drafter batches for request-row alignment")
+            from speculators.models.dflash_prefix.linear_confidence import LinearConfidence
+
+            self.linear_confidence = LinearConfidence(
+                confidence_path, device, self.draft_model_config.get_hidden_size(),
+                self.num_speculative_tokens, max_batch_size=self.max_batch_size,
+                policy=envs.VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_POLICY,
+                budget_per_request=envs.VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_BUDGET,
+            )
+            logger.info("LINEAR_CONFIDENCE enabled checkpoint=%s policy=%s max_batch=%d budget=%d",
+                        confidence_path, self.linear_confidence.policy, self.max_batch_size,
+                        self.linear_confidence.budget_per_request)
+
         trace_directory = (
             envs.VLLM_ASCEND_PREFIX_ACCEPTANCE_TRACE_DIR
         )
@@ -225,24 +261,27 @@ class AscendDflashPrefixProposer(AscendDflashProposer):
         self.acceptance_pending_features = None
         self.acceptance_pending_tokens = None
 
+        if self.linear_confidence is not None:
+            self.linear_confidence.reset()
+        predicting = self.linear_confidence is not None and not self._prefix_in_dummy_run
         collecting = (
             self.acceptance_collector is not None
             and not self._prefix_in_dummy_run
         )
 
-        if collecting:
+        if collecting or predicting:
             if (
                 sampling_metadata is None
                 or not sampling_metadata.all_greedy
             ):
                 raise ValueError(
-                    "Acceptance collection requires target temperature=0."
+                    "Acceptance head requires target temperature=0."
                 )
 
             if not sampling_metadata.no_penalties:
                 raise ValueError(
                     "Use default repetition, frequency and presence "
-                    "penalties during acceptance collection."
+                    "penalties with the acceptance head."
                 )
 
             if (
@@ -251,7 +290,7 @@ class AscendDflashPrefixProposer(AscendDflashProposer):
             ):
                 raise ValueError(
                     "Token allowlists and bad-word constraints are not "
-                    "supported during acceptance collection."
+                    "supported with the acceptance head."
                 )
 
         if self._prefix_disable_selector:
@@ -338,6 +377,7 @@ class AscendDflashPrefixProposer(AscendDflashProposer):
         if (
             self._compiled_prefix
             or self._prefix_inference_mode != "reference"
+            or predicting
         ):
             if self._prefix_inference_runtime is None:
                 if self._compiled_prefix:
@@ -357,7 +397,7 @@ class AscendDflashPrefixProposer(AscendDflashProposer):
                         PrefixInferenceRuntime(head, logger)
                     )
 
-            if collecting:
+            if collecting or predicting:
                 from speculators.models.dflash_prefix.acceptance_features import (
                     build_acceptance_features,
                 )
@@ -381,17 +421,17 @@ class AscendDflashPrefixProposer(AscendDflashProposer):
                     unary_scores=unary,
                     selected_token_ids=selected,
                     final_scores=final_scores,
-                    validate=True,
+                    validate=collecting,
                 )
+
+                if predicting:
+                    self.linear_confidence.predict(features, selected)
 
                 # The model runner will associate these with the actual
                 # submitted request before target verification.
-                self.acceptance_pending_features = (
-                    features.detach().clone()
-                )
-                self.acceptance_pending_tokens = (
-                    selected.detach().clone()
-                )
+                if collecting:
+                    self.acceptance_pending_features = features.detach().clone()
+                    self.acceptance_pending_tokens = selected.detach().clone()
 
             else:
                 selected = self._prefix_inference_runtime.select(

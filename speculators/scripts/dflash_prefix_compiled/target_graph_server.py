@@ -182,6 +182,27 @@ def command_and_record(args):
         getattr(args, "num_speculative_tokens", "auto"),
         getattr(args, "draft_enforce_eager", "omit"),
     )
+    max_num_seqs = getattr(args, "max_num_seqs", 1)
+    if max_num_seqs < 1:
+        raise ValueError("max-num-seqs must be positive")
+    if max_num_seqs > 1 and (args.target_execution != "eager" or head_execution != "reference"):
+        raise ValueError("This batched launcher requires eager target and reference head")
+    linear_policy = getattr(args, "linear_confidence_policy", "argmax")
+    linear_budget = getattr(args, "linear_confidence_budget", 7)
+    if linear_policy not in {"argmax", "budget"}:
+        raise ValueError("Unknown linear confidence policy")
+    linear_enabled = getattr(args, "linear_confidence", False)
+    linear_path = getattr(args, "linear_confidence_head", None)
+    if bool(linear_path) != linear_enabled:
+        raise ValueError("Use --linear-confidence together with --linear-confidence-head PATH")
+    if linear_enabled:
+        linear_path = linear_path.expanduser().resolve(strict=True)
+        if not linear_path.is_file():
+            raise ValueError("Linear confidence checkpoint must be a file")
+        if kind not in PREFIX_KINDS or spec.get("enforce_eager") is not True:
+            raise ValueError("Linear confidence requires an attention-prefix selector and eager draft")
+        if getattr(args, "acceptance_config", None) or os.environ.get("VLLM_ASCEND_PREFIX_ACCEPTANCE_TRACE_DIR"):
+            raise ValueError("Disable acceptance collection/config when using linear confidence")
     acceptance_path = getattr(args, "acceptance_config", None)
     acceptance = None
     if acceptance_path:
@@ -192,6 +213,8 @@ def command_and_record(args):
         if acceptance.get("mode") not in {"collect", "shadow", "adaptive"}:
             raise ValueError("Invalid acceptance mode")
     proposals = spec["num_speculative_tokens"]
+    if linear_enabled and linear_policy == "budget" and not 1 <= linear_budget <= proposals:
+        raise ValueError("Linear confidence budget must be in 1..K")
     verification_tokens = proposals + 1
     if not args.npu.isdecimal() or not 1 <= args.port <= 65535:
         raise ValueError("Use one physical NPU index and a port in [1, 65535]")
@@ -208,6 +231,9 @@ def command_and_record(args):
         if args.target_execution == "graph":
             compilation["cudagraph_capture_sizes"] = [x + 1 for x in lengths]
             compilation["max_cudagraph_capture_size"] = proposals + 1
+    if linear_enabled and args.target_execution == "graph":
+        compilation["cudagraph_capture_sizes"] = list(range(1, proposals + 2))
+        compilation["max_cudagraph_capture_size"] = proposals + 1
     paths = [
         "vllm-ascend/vllm_ascend/worker/model_runner_v1.py",
         "vllm-ascend/vllm_ascend/spec_decode/llm_base_proposer.py",
@@ -228,6 +254,9 @@ def command_and_record(args):
                 "compiled_inference.py" if kind == "compiled_prefix_v3" else "inference_v2.py"
             ),
         ]
+    if linear_enabled:
+        paths += ["speculators/src/speculators/models/dflash_prefix/" + name
+                  for name in ("linear_confidence.py", "acceptance_head.py", "acceptance_features.py")]
     sources = {name: digest(root / name) for name in paths}
     base = (root / paths[1]).read_text()
     if spec.get("enforce_eager") is not None and "self.runner._use_aclgraph() and not self.speculative_config.enforce_eager" not in base:
@@ -241,7 +270,7 @@ def command_and_record(args):
         "--served-model-name", args.served_model_name,
         "--tensor-parallel-size", "1", "--data-parallel-size", "1",
         "--dtype", "bfloat16", "--seed", str(seed), "--generation-config", "vllm",
-        "--max-num-seqs", "1", "--max-model-len", str(args.max_model_len),
+        "--max-num-seqs", str(max_num_seqs), "--max-model-len", str(args.max_model_len),
         "--max-num-batched-tokens", str(args.max_batched_tokens), "--block-size", str(kv_block),
         "--gpu-memory-utilization", str(args.memory_utilization),
         "--no-async-scheduling", "--no-enable-prefix-caching", "--no-enable-chunked-prefill",
@@ -256,6 +285,14 @@ def command_and_record(args):
     if args.graph_metrics:
         command.append("--cudagraph-metrics")
     env = serving_environment(os.environ, kind, head_execution)
+    env.pop("VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_POLICY", None)
+    env.pop("VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_BUDGET", None)
+    if linear_enabled:
+        env["VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_POLICY"] = linear_policy
+        env["VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_BUDGET"] = str(linear_budget)
+    env.pop("VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_HEAD", None)
+    if linear_enabled:
+        env["VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_HEAD"] = str(linear_path)
     env.pop("VLLM_ASCEND_PREFIX_ACCEPTANCE_CONFIG", None)
     if acceptance_path:
         env["VLLM_ASCEND_PREFIX_ACCEPTANCE_CONFIG"] = str(acceptance_path)
@@ -272,6 +309,10 @@ def command_and_record(args):
             raise ValueError("DSpark head graph hook is not installed")
     env["ASCEND_RT_VISIBLE_DEVICES"] = args.npu
     record = {
+        "linear_confidence": {"enabled": linear_enabled, "policy": linear_policy,
+                              "budget_per_request": linear_budget,
+                              "checkpoint": str(linear_path) if linear_path else None,
+                              "sha256": digest(linear_path) if linear_path else None},
         "acceptance": acceptance,
         "target": str(target), "draft": str(draft), "kind": kind,
         "comparison_profile": profile,
@@ -294,6 +335,7 @@ def command_and_record(args):
             k: v for k, v in env.items() if k.startswith("DFLASH_PREFIX_")
         },
         "graph_metrics": bool(args.graph_metrics), "check_only": bool(args.check_only),
+        "max_num_seqs": max_num_seqs,
         "max_model_len": args.max_model_len, "max_batched_tokens": args.max_batched_tokens,
         "memory_utilization": args.memory_utilization,
         "seed": seed, "kv_block_size": kv_block,
@@ -318,7 +360,7 @@ def add_evaluator_record(record, args, log):
         launcher_pid=int(process_stat.split(" ", 1)[0]), launcher_start_ticks=fields[19],
         suggested_method=f"{record['kind']}_bs{record['block_size']}_k{record['proposals']}_{args.target_execution}_{record['head_execution_requested']}",
         device=f"npu:{args.npu}", tp_size=1, dp_size=1, dtype="bfloat16",
-        max_num_seqs=1, prefix_caching=False,
+        max_num_seqs=record["max_num_seqs"], prefix_caching=False,
         enforce_eager=args.target_execution == "eager", model_runner="ascend_v1",
         helper_sha256=digest(Path(__file__)),
     )
@@ -328,6 +370,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("spec-main", "target", "draft", "run-dir"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--max-num-seqs", type=int, default=1)
+    parser.add_argument("--linear-confidence-policy", choices=("argmax", "budget"), default="argmax")
+    parser.add_argument("--linear-confidence-budget", type=int, default=7)
+    parser.add_argument("--linear-confidence", action="store_true")
+    parser.add_argument("--linear-confidence-head", type=Path)
     parser.add_argument("--acceptance-config", type=Path)
     parser.add_argument("--npu", default="6")
     parser.add_argument("--port", type=int, default=8213)
@@ -381,7 +428,7 @@ def main():
     print(f"TARGET_GRAPH_REQUEST mode={args.target_execution} kind={record['kind']} "
           f"block={record['block_size']} proposals={record['proposals']} "
           f"method={record['speculative_method']} draft_execution={record['draft_execution_requested']} "
-          "full_verification=True", flush=True)
+          f"full_verification={not record['linear_confidence']['enabled']}", flush=True)
     print(f"Target: {record['target']}\nDraft: {record['draft']}", flush=True)
     print(f"Draft backend: {record['draft_backend_note']}", flush=True)
     print(f"COMPARISON_REQUEST profile={record['comparison_profile']} target={args.target_execution} "

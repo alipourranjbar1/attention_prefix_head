@@ -71,16 +71,26 @@ export NO_PROXY="localhost,127.0.0.1,::1" no_proxy="localhost,127.0.0.1,::1"
 # writes the exact vLLM command + log + evaluator record, then starts vLLM.
 # Graph mode removes target --enforce-eager; the speculative field stays true
 # for ALL three draft backbones. Learned head graphs are separate.
+LINEAR_ARGS=()
+case "${LINEAR_CONFIDENCE:-0}" in
+    0) ;;
+    1) : "${LINEAR_CONFIDENCE_HEAD:?Set LINEAR_CONFIDENCE_HEAD to your trained final.pt}"
+       LINEAR_ARGS=(--linear-confidence --linear-confidence-head "$LINEAR_CONFIDENCE_HEAD") ;;
+    *) echo "LINEAR_CONFIDENCE must be 0 or 1" >&2; exit 1 ;;
+esac
 ACCEPTANCE_ARGS=()
 if [[ -n "${ACCEPTANCE_CONFIG:-}" ]]; then
     ACCEPTANCE_ARGS=(--acceptance-config "$ACCEPTANCE_CONFIG")
 fi
-exec "$PYTHON_BIN" "$SPEC_MAIN/speculators/scripts/dflash_prefix_compiled/target_graph_server.py" "${ACCEPTANCE_ARGS[@]}" \
+exec "$PYTHON_BIN" "$SPEC_MAIN/speculators/scripts/dflash_prefix_compiled/target_graph_server.py" "${ACCEPTANCE_ARGS[@]}" "${LINEAR_ARGS[@]}" \
     --spec-main "$SPEC_MAIN" --target "$TARGET_MODEL" --draft "$DRAFT_MODEL" \
     --speculative-method "$SPECULATIVE_METHOD" --num-speculative-tokens "$NUM_SPECULATIVE_TOKENS" \
     --target-execution "$TARGET_EXECUTION" --draft-enforce-eager "$DRAFT_ENFORCE_EAGER" \
     --comparison-profile "$COMPARISON_PROFILE" --head-execution "$HEAD_EXECUTION" \
     --mode "$MODE" --npu "$NPU" --port "$PORT" --served-model-name "$SERVED_MODEL_NAME" \
+    --max-num-seqs "${MAX_NUM_SEQS:-1}" \
+    --linear-confidence-policy "${LINEAR_CONFIDENCE_POLICY:-argmax}" \
+    --linear-confidence-budget "${LINEAR_CONFIDENCE_BUDGET:-7}" \
     --seed "$SEED" --kv-block-size "$KV_BLOCK_SIZE" \
     --max-model-len "$MAX_MODEL_LEN" --max-batched-tokens "$MAX_BATCHED_TOKENS" \
     --memory-utilization "$MEMORY_UTILIZATION" --graph-metrics "$GRAPH_METRICS" \

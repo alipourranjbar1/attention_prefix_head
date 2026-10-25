@@ -2117,6 +2117,12 @@ class NPUModelRunner(GPUModelRunner):
                 )
             else:
                 self.draft_token_ids_cpu[:num_reqs, :num_spec_tokens] = 0
+            confidence = getattr(self.drafter, "linear_confidence", None)
+            if confidence is not None:
+                if zeros_only:
+                    confidence.reset()
+                else:
+                    confidence.queue_copy(self._draft_token_req_ids)
             self.draft_token_ids_event.record()
 
     def _record_acceptance_proposal(self, out, collector):
@@ -2193,6 +2199,13 @@ class NPUModelRunner(GPUModelRunner):
             self._record_acceptance_proposal(out, collector)
             # Collection always submits the complete proposal block.
             return out
+        confidence = getattr(self.drafter, "linear_confidence", None)
+        if confidence is not None:
+            cut_tokens = confidence.truncate(out.req_ids, out.draft_token_ids)
+            logger.debug("LINEAR_CONFIDENCE request_ids=%s proposed=%s submitted=%s",
+                         out.req_ids, [len(x) for x in out.draft_token_ids],
+                         [len(x) for x in cut_tokens])
+            return DraftTokenIds(req_ids=out.req_ids, draft_token_ids=cut_tokens)
         dynamic_spec = getattr(self.drafter, "dynamic_spec", None)
         if dynamic_spec is None:
             return out
@@ -2717,6 +2730,9 @@ class NPUModelRunner(GPUModelRunner):
 
         def propose_draft_token_ids(sampled_token_ids):
             drafter = getattr(self, "drafter", None)
+            confidence = getattr(drafter, "linear_confidence", None)
+            if confidence is not None:
+                confidence.reset()
             if getattr(drafter, "acceptance_collector", None) is not None:
                 drafter.acceptance_pending_features = None
                 drafter.acceptance_pending_tokens = None

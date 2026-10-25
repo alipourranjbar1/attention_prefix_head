@@ -36,6 +36,18 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # Acceptance scheduling policy: argmax (default) or fixed shared budget. Not secret.
+    "VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_POLICY": lambda: os.getenv(
+        "VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_POLICY", "argmax"
+    ),
+    # Mean draft verification budget per request for budget policy; 1..K, default 7. Not secret.
+    "VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_BUDGET": lambda: int(os.getenv(
+        "VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_BUDGET", "7"
+    )),
+    # Optional trained acceptance-head path; empty disables truncation. Not secret.
+    "VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_HEAD": lambda: os.getenv(
+        "VLLM_ASCEND_PREFIX_LINEAR_CONFIDENCE_HEAD", ""
+    ),
     # Optional JSON configuration path for the batch-one acceptance pilot.
     # Default empty disables it. Not a credential; modes collect/shadow/adaptive.
     "VLLM_ASCEND_PREFIX_ACCEPTANCE_CONFIG": lambda: os.getenv("VLLM_ASCEND_PREFIX_ACCEPTANCE_CONFIG", ""),

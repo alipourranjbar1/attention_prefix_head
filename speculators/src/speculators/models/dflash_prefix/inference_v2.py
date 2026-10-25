@@ -315,9 +315,10 @@ class PrefixInferenceRuntime:
                 self.audit.record_profile(report)
 
     @torch.no_grad()
-    def select(self, hidden, ids, unary, anchors, *, embedding_weight):
+    def select(self, hidden, ids, unary, anchors, *, embedding_weight, return_scores=False):
         if self.graph_selector is not None:
-            return self._select_combined(hidden, ids, unary, anchors, embedding_weight=embedding_weight)
+            return self._select_combined(hidden, ids, unary, anchors, embedding_weight=embedding_weight,
+                                         return_scores=return_scores)
         kwargs = {"embedding_weight": embedding_weight}
         checking = self.mode == "validate" or self.checked < self.check_steps
         walk = self.fast if self.graph_walk is None else self.graph_walk
@@ -330,7 +331,7 @@ class PrefixInferenceRuntime:
                 self._profile(hidden, ids, unary, anchors, embedding_weight)
             prepared, projected_kv = self.token_cache.prepare(hidden, ids, unary, anchors, **kwargs)
         if self.mode == "reference":
-            return self.head.greedy_walk(prepared)
+            return self.head.walk(prepared, return_scores=True) if return_scores else self.head.greedy_walk(prepared)
         if checking:
             reference = prepared if self.token_cache is None else self.head.prepare_tables(
                 hidden, ids, unary, anchors, **kwargs)
@@ -375,8 +376,8 @@ class PrefixInferenceRuntime:
                     self.checked, self.max_score_error, self.mode, self.graph_walk is not None,
                     "; steady-state fast path enabled" if self.mode == "fast" else "; validation continues",
                 )
-            return actual
-        return walk.walk(prepared, projected_kv=projected_kv)
+            return (actual, actual_scores) if return_scores else actual
+        return walk.walk(prepared, projected_kv=projected_kv, return_scores=return_scores)
 
     def _profile_combined(self, hidden, ids, unary, anchors, embedding_weight):
         # Optional synchronized diagnostics on the first real warmup inputs.
@@ -448,13 +449,13 @@ class PrefixInferenceRuntime:
                                 type(exc).__name__, exc)
 
     @torch.no_grad()
-    def _select_combined(self, hidden, ids, unary, anchors, *, embedding_weight):
+    def _select_combined(self, hidden, ids, unary, anchors, *, embedding_weight, return_scores=False):
         kwargs = {"embedding_weight": embedding_weight}
         checking = self.mode == "validate" or self.checked < self.check_steps
         if not checking:
             # All embedding/projection preparation happens inside replay. No
             # reference execution, score-output stack, host reduction or sync.
-            return self.graph_selector.select(hidden, ids, unary, anchors, **kwargs)
+            return self.graph_selector.select(hidden, ids, unary, anchors, return_scores=return_scores, **kwargs)
 
         prepared = self.head.prepare_tables(hidden, ids, unary, anchors, **kwargs)
         expected, expected_scores = self.head.walk(prepared, return_scores=True)
@@ -497,4 +498,4 @@ class PrefixInferenceRuntime:
                 self.checked, self.max_score_error, self.mode,
                 "; steady-state fast path enabled" if self.mode == "fast" else "; validation continues",
             )
-        return actual
+        return (actual, actual_scores) if return_scores else actual
