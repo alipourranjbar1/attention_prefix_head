@@ -730,8 +730,8 @@ class TrainConfig(BaseSettings):
         untouched, so :meth:`from_flat` round-trips.
         """
         is_eagle3 = self.speculator_type == "eagle3"
-        is_dflash = self.speculator_type in {"dflash", "dflash_prefix"}
-        is_dflash_family = self.speculator_type in {"dflash", "dspark", "dflash2", "dflash_prefix"}
+        is_dflash = self.speculator_type in {"dflash", "dflash_prefix", "dflash_ar"}
+        is_dflash_family = self.speculator_type in {"dflash", "dspark", "dflash2", "dflash_prefix", "dflash_ar"}
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
         if self.draft.norm_before_fc is None:
