@@ -73,10 +73,13 @@ class JSONMetrics(logging.Handler):
 
 
 def load_model(checkpoint):
-    config = ReTraceSpeculatorConfig.from_pretrained(checkpoint)
+    from speculators.models.retrace_prefix.loading import load_config
+    from speculators.models.retrace_prefix.stored_training import ReTracePrefixTraining
+    config = load_config(checkpoint)
+    model_class = ReTracePrefixTraining if config.speculators_model_type == "retrace_prefix" else ReTraceDraftModel
     config.transformer_layer_config._attn_implementation = "sdpa"
     config.training_objective = "stored_pair_kl"
-    model = ReTraceDraftModel.from_pretrained(
+    model = model_class.from_pretrained(
         checkpoint, config=config, dtype=torch.float32, local_files_only=True
     )
     # Training weights/master parameters remain FP32. Only frozen shared

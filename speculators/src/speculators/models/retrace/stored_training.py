@@ -113,6 +113,10 @@ class ReTraceDraftModel(RuntimeReTraceDraftModel):
             start = end
         return documents, candidates
 
+    def auxiliary_loss(self, block, targets, valid, anchors, reference):
+        """Optional objectives on the same clean, causally aligned blocks."""
+        return block.logits.sum() * 0.0, {}
+
     def forward(
         self,
         input_ids,
@@ -233,6 +237,7 @@ class ReTraceDraftModel(RuntimeReTraceDraftModel):
         if not denominator:
             raise ValueError("No clean response labels")
         total_loss = torch.zeros((), device=device)
+        auxiliary_metrics = {}
         label_correct = torch.zeros((), device=device)
         for doc in documents:
             for offset in range(0, len(doc["positions"]), self.blocks_per_forward):
@@ -276,6 +281,13 @@ class ReTraceDraftModel(RuntimeReTraceDraftModel):
                     decay_fn=lambda index, **_: torch.exp(-index.float() / 4.0),
                 )
                 weight = (valid.sum() + 1e-5) / (denominator + 1e-5)
+                reference_index = (target_index + 1).clamp(max=len(doc["tokens"]) - 1)
+                extra, values = self.auxiliary_loss(
+                    result, target_logits, valid, tokens[pos], tokens[reference_index]
+                )
+                loss = loss + extra
+                for name, value in values.items():
+                    auxiliary_metrics[name] = auxiliary_metrics.get(name, 0.0) + value.detach() * weight
                 total_loss = total_loss + loss * weight
                 label_correct += (
                     (result.token_ids == target_logits.argmax(-1)) & valid
@@ -310,4 +322,7 @@ class ReTraceDraftModel(RuntimeReTraceDraftModel):
             "beta_sum": scalar(beta),
             "beta_total": scalar(1),
         }
+        for name, value in auxiliary_metrics.items():
+            metrics[name + "_sum"] = value
+            metrics[name + "_total"] = scalar(1)
         return None, total_loss, metrics

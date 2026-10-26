@@ -19,6 +19,9 @@ from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.models.dflash.config import DFlashSpeculatorConfig
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
+from speculators.models.dflash_prefix.config import DFlashPrefixSpeculatorConfig
+from speculators.models.retrace_prefix import ReTracePrefixDraftModel, ReTracePrefixSpeculatorConfig
+
 from .config import ReTraceSpeculatorConfig
 from .core import ReTraceDraftModel
 
@@ -59,8 +62,9 @@ def source_config(source, target):
     if target_config.model_type != "qwen3":
         raise ValueError("This importer requires the dense Qwen3 target")
     kind = raw.get("speculators_model_type")
-    if kind == "dflash":
-        config = DFlashSpeculatorConfig.from_pretrained(source, local_files_only=True)
+    if kind in {"dflash", "dflash_prefix"}:
+        source_class = DFlashPrefixSpeculatorConfig if kind == "dflash_prefix" else DFlashSpeculatorConfig
+        config = source_class.from_pretrained(source, local_files_only=True)
         tl = config.transformer_layer_config
         layer_ids = config.aux_hidden_state_layer_ids
         block_size, mask_id = config.block_size, config.mask_token_id
@@ -118,13 +122,19 @@ def source_config(source, target):
         mask_token_id=mask_id,
         sample_from_anchor=False,
     )
-    verifier = VerifierConfig.from_pretrained(target)
-    config = ReTraceSpeculatorConfig(
-        **common,
+    verifier = VerifierConfig.from_pretrained(str(target))
+    combined = kind == "dflash_prefix"
+    config_class = ReTracePrefixSpeculatorConfig if combined else ReTraceSpeculatorConfig
+    prefix = {key: value for key, value in config.to_dict().items() if key.startswith("prefix_")} if combined else {}
+    # Joint retraining updates the backbone, conditioner and existing selector.
+    if combined:
+        prefix["prefix_freeze_backbone"] = False
+    config = config_class(
+        **common, **prefix,
         training_objective="clean_block_ce",
         pretrained_source=str(Path(source).absolute()),
         speculators_config=SpeculatorsConfig(
-            algorithm="retrace",
+            algorithm="retrace_prefix" if combined else "retrace",
             default_proposal_method="greedy",
             proposal_methods=[
                 GreedyTokenProposalConfig(speculative_tokens=block_size - 1)
@@ -169,7 +179,8 @@ def load_dflash(source, target, dtype=torch.bfloat16, load_shared=True):
     # Reproducible new conditioning matrices; never reinitialize loaded tensors.
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(42)
-        draft = ReTraceDraftModel(config).to(dtype=dtype)
+        model_class = ReTracePrefixDraftModel if isinstance(config, ReTracePrefixSpeculatorConfig) else ReTraceDraftModel
+        draft = model_class(config).to(dtype=dtype)
     expected = {
         name
         for name in draft.state_dict()
@@ -245,10 +256,14 @@ def prepare(source, target, output):
             "pretrained_fingerprint",
         }:
             raw.pop(key)
-    raw["speculators_model_type"] = "dflash"
-    raw["architectures"] = ["DFlashSpeculator"]
-    raw["speculators_config"]["algorithm"] = "dflash"
-    baseline = DFlashSpeculatorConfig(**raw)
+    combined = isinstance(draft.config, ReTracePrefixSpeculatorConfig)
+    kind = "dflash_prefix" if combined else "dflash"
+    raw.pop("distill_top_k", None)
+    raw.pop("distill_kl_weight", None)
+    raw["speculators_model_type"] = kind
+    raw["architectures"] = ["DFlashPrefixDraftModel" if combined else "DFlashSpeculator"]
+    raw["speculators_config"]["algorithm"] = kind
+    baseline = (DFlashPrefixSpeculatorConfig if combined else DFlashSpeculatorConfig)(**raw)
     baseline_dir = output / "dflash"
     baseline_dir.mkdir()
     baseline.save_pretrained(baseline_dir)

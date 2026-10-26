@@ -121,6 +121,10 @@ class ReTraceDraftModel(DFlashDraftModel):
             )
         hidden = self.norm(hidden)[:, 1:]
         logits = self.lm_head(hidden)
+        return self.make_block(hidden, logits, anchor)
+
+    def make_block(self, hidden, logits, anchors):
+        """Proposal selection hook; subclasses may apply a trained selector."""
         return DraftBlock(hidden, logits, logits.detach().argmax(-1))
 
     def training_blocks(self, context_hidden, anchors, positions, memory, beta=1.0):
@@ -169,4 +173,4 @@ class ReTraceDraftModel(DFlashDraftModel):
             )
         hidden = self.norm(hidden).reshape(count, size, -1)[:, 1:]
         logits = self.lm_head(hidden)
-        return DraftBlock(hidden, logits, logits.detach().argmax(-1))
+        return self.make_block(hidden, logits, anchors)

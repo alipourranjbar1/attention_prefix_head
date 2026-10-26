@@ -31,15 +31,16 @@ def setup(args, device):
     if config.model_type != "qwen3":
         raise ValueError("Expected the dense Qwen3 target")
     if args.draft:
-        saved = ReTraceSpeculatorConfig.from_pretrained(
-            args.draft, local_files_only=True
-        )
-        if saved.speculators_model_type != "retrace":
+        from speculators.models.retrace_prefix.loading import load_config
+        from speculators.models.retrace_prefix import ReTracePrefixDraftModel
+        saved = load_config(args.draft)
+        model_class = ReTracePrefixDraftModel if saved.speculators_model_type == "retrace_prefix" else ReTraceDraftModel
+        if saved.speculators_model_type not in {"retrace", "retrace_prefix"}:
             raise ValueError(
                 "Use an isolated ReTrace checkpoint; legacy DSpARK+ReTrace checkpoints have a different architecture"
             )
         saved.speculators_config.verifier.name_or_path = args.target
-        draft = ReTraceDraftModel.from_pretrained(
+        draft = model_class.from_pretrained(
             args.draft, config=saved, local_files_only=True
         )
     else:

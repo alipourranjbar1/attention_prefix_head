@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from .config import ReTraceSpeculatorConfig
+from speculators.models.retrace_prefix.loading import load_config
 from .launch import stop_group
 from .pretrained import prepare as prepare_weights
 from .stored_data import prepare as prepare_data
@@ -96,6 +96,7 @@ def main():
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--require-prefix", action="store_true", help="Require a trained dflash_prefix source checkpoint")
     args = parser.parse_args()
     if set(args.server_npus) & set(args.trainer_npus):
         parser.error("Target and trainer NPU IDs must be disjoint")
@@ -130,6 +131,9 @@ def main():
     ):
         if not path.is_file():
             parser.error(f"Required local file missing: {path}")
+    source_kind = json.loads((Path(args.base_dflash) / "config.json").read_text()).get("speculators_model_type")
+    if args.require_prefix and source_kind != "dflash_prefix":
+        parser.error("--base-dflash must be the trained dflash_prefix checkpoint, including prefix_head weights")
     if output.exists() and not args.resume:
         parser.error(
             "Use a new output directory, or --resume for this stored-response run"
@@ -140,7 +144,7 @@ def main():
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     endpoint = f"http://127.0.0.1:{args.port}/v1"
     run = vars(args).copy()
-    for name in ("resume", "dry_run", "boot_timeout"):
+    for name in ("resume", "dry_run", "boot_timeout", "require_prefix"):
         run.pop(name)
     run.update(
         output=str(output),
@@ -158,6 +162,11 @@ def main():
         conditioning_history="one sampled unconditioned source + aligned conditioned successor",
         checkpoint_cadence="each epoch; stock Trainer checkpoint format",
     )
+    if source_kind == "dflash_prefix":
+        run.update(protocol="stored_pair_prefix_top16_kl_v1",
+                   objective="full-vocabulary KL + prefix_loss_alpha * selector CE + 0.1 * target-top16 restricted KL",
+                   distill_top_k=16, distill_kl_weight=0.1,
+                   retrace_source_commit="89b5caa300f473c1e3127497e6f594ba024057d5")
     if args.resume:
         previous = json.loads((output / "stored_run.json").read_text())
         if previous != run:
@@ -186,7 +195,7 @@ def main():
     if not args.resume:
         output.mkdir(parents=True)
         prepare_weights(args.base_dflash, args.target, output / "initial")
-        config = ReTraceSpeculatorConfig.from_pretrained(output / "initial/retrace")
+        config = load_config(output / "initial/retrace")
         manifest = prepare_data(
             args.data,
             output / "stored_data",
@@ -216,7 +225,7 @@ def main():
                 )
         (output / "stored_run.json").write_text(json.dumps(run, indent=2) + "\n")
     else:
-        config = ReTraceSpeculatorConfig.from_pretrained(output / "initial/retrace")
+        config = load_config(output / "initial/retrace")
     max_len = args.prompt_length + args.response_length + config.block_size + 1
     server_command = [
         sys.executable,
@@ -277,7 +286,7 @@ def main():
     if args.resume:
         trainer_command.append("--resume")
     # Bash wrapper restores CANN; the run-specific environment is inherited.
-    wrapper = root / "speculators/examples/train/train_retrace_dflash_stored_vllm.sh"
+    wrapper = root / "speculators/examples/train/train_retrace_prefix_stored.sh"
     resume_args = [x for x in sys.argv[1:] if x != "--resume"]
     (output / "resume_stored.sh").write_text(
         "#!/usr/bin/env bash\nset -eo pipefail\nexec bash "

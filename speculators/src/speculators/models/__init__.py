@@ -28,3 +28,4 @@ __all__ = [
 from .dflash_prefix import DFlashPrefixDraftModel, DFlashPrefixSpeculatorConfig
 
 from .dflash_ar import DFlashARDraftModel, DFlashARSpeculatorConfig
+from .retrace_prefix import ReTracePrefixDraftModel, ReTracePrefixSpeculatorConfig
