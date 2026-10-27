@@ -1522,10 +1522,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # Dynamic verify-length path, implemented in DynamicSpecScheduler
                 # Only the dspark method is handled here since it relies on
                 # the DSpark confidence head.
-                if self.dynamic_spec is not None:
+                confidence = getattr(self, "dspark_confidence", None)
+                if confidence is not None and not getattr(self, "_dspark_in_dummy_run", False):
+                    confidence.predict(
+                        self.model, sample_hidden_states[:num_blk * self.num_speculative_tokens],
+                        draft_token_ids, sampling_metadata)
+                elif self.dynamic_spec is not None:
                     self.dynamic_spec.update(
                         model=self.model,
-                        last_hidden_states=last_hidden_states,
+                        last_hidden_states=sample_hidden_states[:num_blk * self.num_speculative_tokens],
                         draft_token_ids=draft_token_ids,
                         num_reqs=num_blk,
                     )

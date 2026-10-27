@@ -82,7 +82,17 @@ ACCEPTANCE_ARGS=()
 if [[ -n "${ACCEPTANCE_CONFIG:-}" ]]; then
     ACCEPTANCE_ARGS=(--acceptance-config "$ACCEPTANCE_CONFIG")
 fi
-exec "$PYTHON_BIN" "$SPEC_MAIN/speculators/scripts/dflash_prefix_compiled/target_graph_server.py" "${ACCEPTANCE_ARGS[@]}" "${LINEAR_ARGS[@]}" \
+CONFIDENCE_ARGS=()
+if [[ -n "${DSPARK_CONFIDENCE_MODE:-}" ]]; then
+    CONFIDENCE_ARGS=(--dspark-confidence-mode "$DSPARK_CONFIDENCE_MODE"
+        --dspark-confidence-threshold "${DSPARK_CONFIDENCE_THRESHOLD:-0.3}"
+        --dspark-confidence-initial-budget "${DSPARK_CONFIDENCE_INITIAL_BUDGET:-5}"
+        --dspark-confidence-update-interval "${DSPARK_CONFIDENCE_UPDATE_INTERVAL:-16}")
+    if [[ -n "${DSPARK_CONFIDENCE_TRACE_DIR:-}" ]]; then
+        CONFIDENCE_ARGS+=(--dspark-confidence-trace-dir "$DSPARK_CONFIDENCE_TRACE_DIR")
+    fi
+fi
+exec "$PYTHON_BIN" "$SPEC_MAIN/speculators/scripts/dflash_prefix_compiled/target_graph_server.py" "${ACCEPTANCE_ARGS[@]}" "${LINEAR_ARGS[@]}" "${CONFIDENCE_ARGS[@]}" \
     --spec-main "$SPEC_MAIN" --target "$TARGET_MODEL" --draft "$DRAFT_MODEL" \
     --speculative-method "$SPECULATIVE_METHOD" --num-speculative-tokens "$NUM_SPECULATIVE_TOKENS" \
     --target-execution "$TARGET_EXECUTION" --draft-enforce-eager "$DRAFT_ENFORCE_EAGER" \

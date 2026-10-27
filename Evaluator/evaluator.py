@@ -1736,6 +1736,9 @@ def main():
                         sort_keys=True, separators=(",", ":")
                     ).encode()).hexdigest() for r in rows]
                     cell["prompt_hashes"] = [r["prompt_sha256"] for r in rows]
+                    # Join diagnostic verifier traces to measured requests only,
+                    # excluding untimed warmup and unrelated server traffic.
+                    cell["request_ids"] = [r["request_id"] for r in rows]
                     cell["output_hashes"] = [hashlib.sha256(json.dumps(
                         [r["output_token_ids"], r["finish_reason"]], separators=(",", ":")
                     ).encode()).hexdigest() for r in rows]

@@ -20,6 +20,7 @@ from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer, _compu
 from vllm.logger import logger
 from vllm_ascend import envs
 from vllm_ascend.spec_decode.dspark_head_graph import DSparkHeadGraph
+from vllm_ascend.spec_decode.dspark_confidence import DSparkConfidence
 from vllm_ascend.spec_decode.utils import DynamicSpecScheduler
 
 
@@ -72,6 +73,40 @@ class AscendDSparkProposer(AscendDflashProposer):
                 num_speculative_tokens=self.num_speculative_tokens,
                 device=device,
             )
+        self.dspark_confidence = None
+        confidence = get_ascend_config().dspark_confidence_config
+        if confidence.mode != "off":
+            parallel = vllm_config.parallel_config
+            scheduler = vllm_config.scheduler_config
+            if (self.dynamic_spec is not None or dynamic_spec_config.method is not None
+                    or scheduler.async_scheduling or scheduler.enable_chunked_prefill
+                    or (parallel.tensor_parallel_size, parallel.pipeline_parallel_size,
+                        parallel.data_parallel_size) != (1, 1, 1)
+                    or self.speculative_config.disable_padded_drafter_batch
+                    or self.speculative_config.draft_sample_method != "greedy"
+                    or get_ascend_config().enable_reduce_sample):
+                raise ValueError("DSpark confidence requires synchronous padded greedy decoding, "
+                                 "TP=PP=DP=1, unchunked prefill, reduce_sample off, and no other dynamic policy")
+            if confidence.min_verify_tokens > self.num_speculative_tokens:
+                raise ValueError("Minimum confidence verification budget exceeds proposal count")
+            policy = DynamicSpecScheduler(
+                method="dspark", method_params={
+                    key: getattr(confidence, key) for key in (
+                        "initial_verify_budget_per_req", "budget_update_interval",
+                        "budget_threshold", "min_verify_tokens")},
+                max_batch_size=self.max_batch_size,
+                num_speculative_tokens=self.num_speculative_tokens, device=device)
+            eos = getattr(vllm_config.model_config.hf_text_config, "eos_token_id", None)
+            eos = [eos] if isinstance(eos, int) else (eos or [])
+            generation_eos = vllm_config.model_config.try_get_generation_config().get("eos_token_id")
+            if generation_eos is not None:
+                eos = [*eos, *([generation_eos] if isinstance(generation_eos, int) else generation_eos)]
+            self.dspark_confidence = DSparkConfidence(
+                mode=confidence.mode, scheduler=policy, max_batch_size=self.max_batch_size,
+                num_proposals=self.num_speculative_tokens,
+                trace_directory=confidence.trace_directory, eos_token_ids=eos)
+            logger.info("DSPARK_CONFIDENCE mode=%s trace=%s verifier_cut=%s",
+                        confidence.mode, confidence.trace_directory, confidence.mode == "cut")
         # DSpark runs eager only (Ascend cudagraph unsupported on this path).
         self.use_cuda_graph = False
         # Separate Markov graph; never enable unsupported draft-attention capture.
@@ -122,6 +157,16 @@ class AscendDSparkProposer(AscendDflashProposer):
         self._per_group_query_slot_mapping_buffers: dict[int, torch.Tensor] = {}
         self._per_group_context_slot_mapping_buffers: dict[int, torch.Tensor] = {}
         self._context_slot_mapping_buffers: list[torch.Tensor | None] | None = None
+
+    def load_model(self, model):
+        super().load_model(model)
+        if self.dspark_confidence is not None:
+            if type(self.model).__name__ != "Qwen3DSparkForCausalLM":
+                raise ValueError("Confidence comparison currently supports the Qwen3 DSpark backend")
+            if self.model.model.confidence_head is None:
+                raise ValueError("The DSpark checkpoint does not contain trained confidence-head weights")
+            if getattr(self.model, "draft_id_to_target_id", None) is not None:
+                raise ValueError("Confidence comparison requires the full target vocabulary")
 
     def _compute_confidence(
         self,

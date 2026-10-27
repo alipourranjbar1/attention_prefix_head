@@ -18,6 +18,7 @@ from __future__ import annotations
 import dataclasses
 import importlib.util
 import json
+import math
 import os
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -502,6 +503,7 @@ class AscendConfig:
     finegrained_tp_config: FinegrainedTPConfig = dataclasses.field(default_factory=lambda: FinegrainedTPConfig())
     scheduler_config: SchedulerConfig = dataclasses.field(default_factory=lambda: SchedulerConfig())
     dynamic_spec_config: DynamicSpecConfig = dataclasses.field(default_factory=lambda: DynamicSpecConfig())
+    dspark_confidence_config: DSparkConfidenceConfig = dataclasses.field(default_factory=lambda: DSparkConfidenceConfig())
     # Still factory-injected: construction depends on vllm_config.
     sparse_kv_offload_config: Any = dataclasses.field(kw_only=True)
     kvpp_config: KVPPConfig = dataclasses.field(default_factory=KVPPConfig, kw_only=True)
@@ -1048,6 +1050,28 @@ class DynamicSpecConfig:
             raise ValueError(
                 f"dynamic_spec_config.method must be one of {self.SUPPORTED_METHODS} or None, got {self.method!r}"
             )
+        return self
+
+
+@config
+class DSparkConfidenceConfig:
+    """Observe the built-in DSpark head, optionally shortening verification."""
+
+    mode: Literal["off", "observe", "cut"] = "off"
+    trace_directory: str | None = None
+    initial_verify_budget_per_req: int = 5
+    budget_update_interval: int = 16
+    budget_threshold: float = 0.3
+    min_verify_tokens: int = 1
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.mode == "off" and self.trace_directory:
+            raise ValueError("Confidence tracing requires observe or cut mode")
+        if min(self.initial_verify_budget_per_req, self.budget_update_interval, self.min_verify_tokens) < 1:
+            raise ValueError("Confidence budgets and update interval must be positive")
+        if not math.isfinite(self.budget_threshold) or not 0 <= self.budget_threshold <= 1:
+            raise ValueError("Confidence budget threshold must be in [0, 1]")
         return self
 
 

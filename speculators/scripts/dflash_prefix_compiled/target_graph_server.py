@@ -213,6 +213,29 @@ def command_and_record(args):
         if acceptance.get("mode") not in {"collect", "shadow", "adaptive"}:
             raise ValueError("Invalid acceptance mode")
     proposals = spec["num_speculative_tokens"]
+    confidence_mode = getattr(args, "dspark_confidence_mode", None)
+    confidence = None
+    if confidence_mode is not None:
+        if kind != "dspark":
+            raise ValueError("DSpark confidence modes require a DSpark checkpoint")
+        if confidence_mode != "off" and not json.loads((draft / "config.json").read_text()).get("enable_confidence_head", False):
+            raise ValueError("DSpark checkpoint configuration disables the confidence head")
+        if confidence_mode not in {"off", "observe", "cut"}:
+            raise ValueError("Invalid DSpark confidence mode")
+        trace = getattr(args, "dspark_confidence_trace_dir", None)
+        threshold = getattr(args, "dspark_confidence_threshold", 0.3)
+        initial = getattr(args, "dspark_confidence_initial_budget", 5)
+        interval = getattr(args, "dspark_confidence_update_interval", 16)
+        if (trace and confidence_mode == "off") or not math.isfinite(threshold) or not 0 <= threshold <= 1:
+            raise ValueError("Tracing requires an enabled confidence head; threshold must be in [0,1]")
+        if not 1 <= initial <= proposals or interval < 1:
+            raise ValueError("Initial confidence budget must be in 1..K and update interval positive")
+        if spec.get("enforce_eager") is not True or linear_enabled or acceptance_path:
+            raise ValueError("DSpark confidence requires an eager draft and no other acceptance policy")
+        confidence = dict(mode=confidence_mode,
+                          trace_directory=str(trace.expanduser().resolve()) if trace else None,
+                          budget_threshold=threshold, initial_verify_budget_per_req=initial,
+                          budget_update_interval=interval, min_verify_tokens=1)
     if linear_enabled and linear_policy == "budget" and not 1 <= linear_budget <= proposals:
         raise ValueError("Linear confidence budget must be in 1..K")
     verification_tokens = proposals + 1
@@ -223,6 +246,12 @@ def command_and_record(args):
     if not max(block, verification_tokens) <= args.max_model_len <= args.max_batched_tokens:
         raise ValueError("Unchunked prefill requires MAX_BATCHED_TOKENS >= MAX_MODEL_LEN >= block")
     compilation, additional = execution_config(args.target_execution, verification_tokens)
+    if confidence is not None:
+        additional["dspark_confidence_config"] = confidence
+        # Capture identical buckets in all three modes for a matched comparison.
+        if args.target_execution == "graph":
+            compilation["cudagraph_capture_sizes"] = list(range(2, proposals + 2))
+            compilation["max_cudagraph_capture_size"] = proposals + 1
     if acceptance and acceptance["mode"] == "adaptive":
         lengths = acceptance.get("verify_lengths", list(range(1, proposals + 1)))
         if (not lengths or any(type(x) is not int for x in lengths)
@@ -245,6 +274,10 @@ def command_and_record(args):
     if kind == "dspark":
         paths += ["vllm-ascend/vllm_ascend/spec_decode/dspark_proposer.py",
                   "vllm/vllm/model_executor/models/qwen3_dspark.py"]
+        if confidence is not None:
+            paths += ["vllm-ascend/vllm_ascend/spec_decode/dspark_confidence.py",
+                      "vllm-ascend/vllm_ascend/spec_decode/utils.py",
+                      "vllm-ascend/vllm_ascend/ascend_config.py"]
     if kind in PREFIX_KINDS:
         paths += [
             "vllm-ascend/vllm_ascend/spec_decode/dflash_prefix_proposer.py",
@@ -309,6 +342,7 @@ def command_and_record(args):
             raise ValueError("DSpark head graph hook is not installed")
     env["ASCEND_RT_VISIBLE_DEVICES"] = args.npu
     record = {
+        "dspark_confidence": confidence,
         "linear_confidence": {"enabled": linear_enabled, "policy": linear_policy,
                               "budget_per_request": linear_budget,
                               "checkpoint": str(linear_path) if linear_path else None,
@@ -341,6 +375,20 @@ def command_and_record(args):
         "seed": seed, "kv_block_size": kv_block,
         "note": "Requested configuration; runtime graph use must be confirmed in the server log. No NPU speedup or target-output parity is certified by this launcher.",
     }
+    if confidence is not None:
+        # Hash weights outside the measured interval; paths alone do not prove
+        # that separate server launches used the same target and draft.
+        for name, directory in (("target", target), ("draft", draft)):
+            hasher = hashlib.sha256()
+            files = [directory / "config.json", *sorted(directory.glob("*.safetensors"))]
+            if len(files) < 2:
+                raise ValueError(f"Missing {name} safetensors weights")
+            for path in files:
+                hasher.update(path.name.encode() + b"\0")
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                        hasher.update(chunk)
+            record[name + "_sha256"] = hasher.hexdigest()
     return root, command, env, record
 
 
@@ -376,6 +424,11 @@ def main():
     parser.add_argument("--linear-confidence", action="store_true")
     parser.add_argument("--linear-confidence-head", type=Path)
     parser.add_argument("--acceptance-config", type=Path)
+    parser.add_argument("--dspark-confidence-mode", choices=("off", "observe", "cut"))
+    parser.add_argument("--dspark-confidence-trace-dir", type=Path)
+    parser.add_argument("--dspark-confidence-threshold", type=float, default=0.3)
+    parser.add_argument("--dspark-confidence-initial-budget", type=int, default=5)
+    parser.add_argument("--dspark-confidence-update-interval", type=int, default=16)
     parser.add_argument("--npu", default="6")
     parser.add_argument("--port", type=int, default=8213)
     parser.add_argument("--target-execution", choices=("graph", "eager"), default="graph")
@@ -428,7 +481,7 @@ def main():
     print(f"TARGET_GRAPH_REQUEST mode={args.target_execution} kind={record['kind']} "
           f"block={record['block_size']} proposals={record['proposals']} "
           f"method={record['speculative_method']} draft_execution={record['draft_execution_requested']} "
-          f"full_verification={not record['linear_confidence']['enabled']}", flush=True)
+          f"full_verification={not record['linear_confidence']['enabled'] and (record['dspark_confidence'] or {}).get('mode') != 'cut'}", flush=True)
     print(f"Target: {record['target']}\nDraft: {record['draft']}", flush=True)
     print(f"Draft backend: {record['draft_backend_note']}", flush=True)
     print(f"COMPARISON_REQUEST profile={record['comparison_profile']} target={args.target_execution} "

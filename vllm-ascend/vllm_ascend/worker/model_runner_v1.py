@@ -2123,6 +2123,12 @@ class NPUModelRunner(GPUModelRunner):
                     confidence.reset()
                 else:
                     confidence.queue_copy(self._draft_token_req_ids)
+            dspark_confidence = getattr(self.drafter, "dspark_confidence", None)
+            if dspark_confidence is not None:
+                if zeros_only:
+                    dspark_confidence.reset()
+                else:
+                    dspark_confidence.queue_copy(self._draft_token_req_ids)
             self.draft_token_ids_event.record()
 
     def _record_acceptance_proposal(self, out, collector):
@@ -2194,6 +2200,10 @@ class NPUModelRunner(GPUModelRunner):
         out = super().take_draft_token_ids()
         if out is None:
             return None
+        dspark_confidence = getattr(self.drafter, "dspark_confidence", None)
+        if dspark_confidence is not None:
+            return DraftTokenIds(req_ids=out.req_ids, draft_token_ids=dspark_confidence.submit(
+                out.req_ids, out.draft_token_ids))
         collector = getattr(self.drafter, "acceptance_collector", None)
         if collector is not None:
             self._record_acceptance_proposal(out, collector)
@@ -2733,6 +2743,9 @@ class NPUModelRunner(GPUModelRunner):
             confidence = getattr(drafter, "linear_confidence", None)
             if confidence is not None:
                 confidence.reset()
+            dspark_confidence = getattr(drafter, "dspark_confidence", None)
+            if dspark_confidence is not None:
+                dspark_confidence.reset()
             if getattr(drafter, "acceptance_collector", None) is not None:
                 drafter.acceptance_pending_features = None
                 drafter.acceptance_pending_tokens = None
@@ -3048,6 +3061,14 @@ class NPUModelRunner(GPUModelRunner):
             }
 
         collector = getattr(getattr(self, "drafter", None), "acceptance_collector", None)
+        dspark_confidence = getattr(getattr(self, "drafter", None), "dspark_confidence", None)
+        if dspark_confidence is not None:
+            if scheduler_output.has_structured_output_requests:
+                raise ValueError("DSpark confidence does not support grammar constraints")
+            dspark_confidence.verified(
+                req_ids_output_copy, scheduler_output.scheduled_spec_decode_tokens,
+                valid_sampled_token_ids, discard_sampled_tokens_req_indices,
+                scheduler_output.finished_req_ids)
         if collector is not None:
             self._record_acceptance_verification(
                 collector,
