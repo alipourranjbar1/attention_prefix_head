@@ -47,6 +47,16 @@ def checkpoint(draft, target, method="auto", proposals="auto", draft_enforce_eag
     if target_cfg.get("model_type") != "qwen3":
         raise ValueError("This controlled launcher supports Qwen3 text targets")
     family = cfg.get("speculators_model_type")
+    # Released Qwen3 DSpark checkpoints use a flat HF config, without the
+    # Speculators family marker or nested transformer_layer_config. vLLM also
+    # accepts the older DSparkDraftModel spelling for model_type=qwen3.
+    native_dspark = (
+        family is None and cfg.get("model_type") == "qwen3"
+        and any(name in {"Qwen3DSparkModel", "DSparkDraftModel"}
+                for name in (cfg.get("architectures") or []))
+    )
+    if native_dspark:
+        family = "dspark"
     if family in {"dflash", "dspark"}:
         kind = family
     elif family == "dflash_prefix" and cfg.get("prefix_selector_kind") in {
@@ -60,7 +70,10 @@ def checkpoint(draft, target, method="auto", proposals="auto", draft_enforce_eag
         if cfg.get("prefix_walk_backend", "torch") != "torch":
             raise ValueError("Attention selectors require prefix_walk_backend=torch")
     else:
-        raise ValueError("Expected a Speculators DFlash, attention-prefix, or DSpark checkpoint")
+        raise ValueError("Expected a Speculators draft or a native Qwen3 DSpark checkpoint; "
+                         f"got model_type={cfg.get('model_type')!r}, "
+                         f"architectures={cfg.get('architectures')!r}, "
+                         f"speculators_model_type={family!r}")
     expected_method = "dspark" if family == "dspark" else "dflash"
     if method == "auto":
         method = expected_method
@@ -71,7 +84,10 @@ def checkpoint(draft, target, method="auto", proposals="auto", draft_enforce_eag
         raise ValueError("Expected an integer checkpoint block_size >= 2")
     if family != "dspark" and block not in (8, 16):
         raise ValueError("This DFlash graph recipe supports block_size 8 or 16")
-    sample_anchor = cfg.get("sample_from_anchor", False)
+    # The native loader defaults to sampling the first proposal from the
+    # anchor position: its block_size already counts proposal positions.
+    # Speculators exports retain their explicit, usually false, setting.
+    sample_anchor = cfg.get("sample_from_anchor", native_dspark)
     if type(sample_anchor) is not bool:
         raise ValueError("sample_from_anchor must be a boolean")
     available = block if family == "dspark" and sample_anchor else block - 1
@@ -90,7 +106,7 @@ def checkpoint(draft, target, method="auto", proposals="auto", draft_enforce_eag
             raise ValueError(f"DSpark checkpoint provides {available} trained proposal positions")
     elif proposals != available:
         raise ValueError("DFlash/Prefix NUM_SPECULATIVE_TOKENS must equal checkpoint block_size - 1")
-    layer = cfg.get("transformer_layer_config", {})
+    layer = cfg if native_dspark else cfg.get("transformer_layer_config", {})
     for key in ("hidden_size", "vocab_size"):
         expected = (cfg.get("target_hidden_size") or layer.get(key)) if key == "hidden_size" else layer.get(key)
         if not target_cfg.get(key) or expected != target_cfg[key]:
@@ -273,7 +289,9 @@ def command_and_record(args):
     ]
     if kind == "dspark":
         paths += ["vllm-ascend/vllm_ascend/spec_decode/dspark_proposer.py",
-                  "vllm/vllm/model_executor/models/qwen3_dspark.py"]
+                  "vllm/vllm/model_executor/models/qwen3_dspark.py",
+                  "vllm-ascend/vllm_ascend/models/qwen3_dspark.py",
+                  "vllm-ascend/vllm_ascend/patch/platform/patch_speculative_config.py"]
         if confidence is not None:
             paths += ["vllm-ascend/vllm_ascend/spec_decode/dspark_confidence.py",
                       "vllm-ascend/vllm_ascend/spec_decode/utils.py",
@@ -332,7 +350,8 @@ def command_and_record(args):
     if kind == "dspark" and profile != "custom":
         env["VLLM_ASCEND_DSPARK_HEAD_GRAPH"] = "off" if head_execution == "reference" else head_execution
         config = json.loads((draft / "config.json").read_text())
-        if config.get("draft_vocab_size") not in (None, config["transformer_layer_config"]["vocab_size"]):
+        vocab_size = config.get("transformer_layer_config", config).get("vocab_size")
+        if config.get("draft_vocab_size") not in (None, vocab_size):
             raise ValueError("Matched DSpark head graph supports full-vocabulary checkpoints only")
     dspark_graph = env["VLLM_ASCEND_DSPARK_HEAD_GRAPH"]
     if dspark_graph != "off":

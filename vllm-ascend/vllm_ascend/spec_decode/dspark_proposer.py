@@ -161,7 +161,11 @@ class AscendDSparkProposer(AscendDflashProposer):
     def load_model(self, model):
         super().load_model(model)
         if self.dspark_confidence is not None:
-            if type(self.model).__name__ != "Qwen3DSparkForCausalLM":
+            # Resolve after loading to avoid eager model/registry imports.
+            # Ascend registers a subclass with the same confidence contract.
+            from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
+
+            if not isinstance(self.model, Qwen3DSparkForCausalLM):
                 raise ValueError("Confidence comparison currently supports the Qwen3 DSpark backend")
             if self.model.model.confidence_head is None:
                 raise ValueError("The DSpark checkpoint does not contain trained confidence-head weights")

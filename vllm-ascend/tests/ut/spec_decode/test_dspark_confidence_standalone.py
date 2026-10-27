@@ -337,6 +337,130 @@ class ConfidenceTests(unittest.TestCase):
             self.assertEqual(records[0][key], records[2][key])
         self.assertNotEqual(records[0]["target_sha256"], records[0]["draft_sha256"])
 
+    def native_fixture(self, architecture="Qwen3DSparkModel"):
+        args = self.fixture_args()
+        config = dict(
+            model_type="qwen3",
+            architectures=[architecture],
+            block_size=7,
+            hidden_size=16,
+            vocab_size=32,
+            markov_rank=8,
+            enable_confidence_head=True,
+            confidence_head_with_markov=True,
+            mask_token_id=31,
+            target_layer_ids=[1, 9, 17, 25, 33],
+        )
+        if architecture == "DSparkDraftModel":
+            config["dflash_config"] = {key: config.pop(key) for key in ("mask_token_id", "target_layer_ids")}
+        (args.draft / "config.json").write_text(json.dumps(config))
+        return args, config
+
+    def test_native_checkpoint_defaults_count_seven_proposals_and_do_not_edit_config(self):
+        for architecture in ("Qwen3DSparkModel", "DSparkDraftModel"):
+            args, _ = self.native_fixture(architecture)
+            before = (args.draft / "config.json").read_bytes()
+            for requested in ("auto", "7"):
+                _, _, kind, block, spec = launcher.checkpoint(args.draft, args.target, "dspark", requested)
+                self.assertEqual((kind, block, spec["num_speculative_tokens"]), ("dspark", 7, 7))
+            self.assertEqual((args.draft / "config.json").read_bytes(), before)
+
+    def test_native_modes_support_flat_vocab_and_capture_all_verifier_widths(self):
+        args, _ = self.native_fixture()
+        args.num_speculative_tokens = "7"
+        for head in ("reference", "fast"):
+            args.head_execution = head
+            args.comparison_profile = "matched_reference" if head == "reference" else "matched_fast"
+            records = []
+            for mode in ("off", "observe", "cut"):
+                args.dspark_confidence_mode = mode
+                _, _, _, record = launcher.command_and_record(args)
+                self.assertEqual(record["verification_tokens"], 8)
+                self.assertEqual(record["compilation_config"]["cudagraph_capture_sizes"], list(range(2, 9)))
+                self.assertEqual(record["dspark_head_graph"], "off" if head == "reference" else "fast")
+                records.append(record)
+            self.assertEqual(records[0]["speculative_config"], records[2]["speculative_config"])
+            self.assertEqual(records[0]["draft_sha256"], records[2]["draft_sha256"])
+
+    def test_native_config_keeps_explicit_anchor_semantics_and_validation(self):
+        args, config = self.native_fixture()
+        config.update(sample_from_anchor=False, block_size=8)
+        (args.draft / "config.json").write_text(json.dumps(config))
+        self.assertEqual(launcher.checkpoint(args.draft, args.target)[-1]["num_speculative_tokens"], 7)
+        config["block_size"] = 7
+        (args.draft / "config.json").write_text(json.dumps(config))
+        with self.assertRaisesRegex(ValueError, "6 trained proposal positions"):
+            launcher.checkpoint(args.draft, args.target, proposals="7")
+        for key, value, error in (
+            ("architectures", ["Qwen3ForCausalLM"], "native Qwen3 DSpark"),
+            ("hidden_size", 32, "hidden_size mismatch"),
+            ("vocab_size", 64, "vocab_size mismatch"),
+        ):
+            args, original = self.native_fixture()
+            original[key] = value
+            (args.draft / "config.json").write_text(json.dumps(original))
+            with self.assertRaisesRegex(ValueError, error):
+                launcher.checkpoint(args.draft, args.target)
+        args, _ = self.native_fixture()
+        with self.assertRaisesRegex(ValueError, "requires method=dspark"):
+            launcher.checkpoint(args.draft, args.target, method="dflash")
+
+    def test_native_checkpoint_still_requires_confidence_and_full_vocab(self):
+        for changes, error in (
+            (dict(enable_confidence_head=False), "disables the confidence head"),
+            (dict(draft_vocab_size=16), "full-vocabulary"),
+        ):
+            args, config = self.native_fixture()
+            config.update(changes)
+            (args.draft / "config.json").write_text(json.dumps(config))
+            args.dspark_confidence_mode = "observe"
+            with self.assertRaisesRegex(ValueError, error):
+                launcher.command_and_record(args)
+
+    def test_loaded_ascend_subclass_is_accepted_but_missing_head_and_mapping_are_rejected(self):
+        tree = ast.parse((ROOT / "vllm-ascend/vllm_ascend/spec_decode/dspark_proposer.py").read_text())
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AscendDSparkProposer")
+        method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == "load_model")
+
+        class BaseProposer:
+            def load_model(self, model):
+                self.model = model
+
+        class Qwen3DSparkForCausalLM:
+            def __init__(self):
+                self.model = SimpleNamespace(confidence_head=object())
+                self.draft_id_to_target_id = None
+
+        class AscendQwen3DSparkForCausalLM(Qwen3DSparkForCausalLM):
+            pass
+
+        ns = dict(BaseProposer=BaseProposer)
+        derived = ast.ClassDef(
+            name="Proposer",
+            bases=[ast.Name(id="BaseProposer", ctx=ast.Load())],
+            keywords=[],
+            body=[method],
+            decorator_list=[],
+        )
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[derived], type_ignores=[])), "load_model", "exec"), ns)
+        module = SimpleNamespace(Qwen3DSparkForCausalLM=Qwen3DSparkForCausalLM)
+        with patch.dict(sys.modules, {"vllm.model_executor.models.qwen3_dspark": module}):
+            proposer = ns["Proposer"]()
+            proposer.dspark_confidence = object()
+            for model in (Qwen3DSparkForCausalLM(), AscendQwen3DSparkForCausalLM()):
+                proposer.load_model(model)
+                self.assertIs(proposer.model, model)
+            with self.assertRaisesRegex(ValueError, "Qwen3 DSpark backend"):
+                proposer.load_model(object())
+            model = AscendQwen3DSparkForCausalLM()
+            model.model.confidence_head = None
+            with self.assertRaisesRegex(ValueError, "confidence-head weights"):
+                proposer.load_model(model)
+            model.model.confidence_head = object()
+            model.draft_id_to_target_id = torch.arange(4)
+            with self.assertRaisesRegex(ValueError, "full target vocabulary"):
+                proposer.load_model(model)
+
     def benchmark(self, mode):
         args = self.fixture_args()
         args.dspark_confidence_mode = mode

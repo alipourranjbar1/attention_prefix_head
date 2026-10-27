@@ -4,6 +4,14 @@ This uses the **built-in DSpark confidence head** stored in the draft checkpoint
 separate from the DFlash-Prefix `linear_head_selector/final.pt` MLP. The DSpark
 backbone and Markov proposer stay enabled in every mode.
 
+Both Speculators exports and native Hugging Face Qwen3 DSpark checkpoints are
+supported, including the legacy `DSparkDraftModel` architecture spelling.
+For the released `deepseek-ai/dspark_qwen3_4b_block7` checkpoint, the config's
+`block_size=7` counts seven proposal positions (sampling from the anchor by
+default); the target verifies eight positions including its anchor/bonus.
+Set `NUM_SPECULATIVE_TOKENS=7`. Do not edit the checkpoint to add a Speculators
+marker or change its block size. The Ascend Qwen3 DSpark subclass is supported.
+
 | `DSPARK_CONFIDENCE_MODE` | Compute confidence | Shorten verifier input |
 | --- | --- | --- |
 | `off` | No | No |
