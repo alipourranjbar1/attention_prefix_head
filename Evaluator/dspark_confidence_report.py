@@ -6,6 +6,7 @@ import copy
 import csv
 import json
 import math
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -127,7 +128,9 @@ def accuracy_report(trace_directory, report):
         request_ids = cell.get("request_ids")
         if not request_ids or any(not rid for rid in request_ids):
             raise ValueError("Run the patched evaluator to retain measured request IDs")
-        # /v1/completions with one prompt and n=1 uses engine ID <API ID>-0.
+        # /v1/completions with one prompt and n=1 supplies <API ID>-0.
+        # InputProcessor.assign_request_id then adds an 8-hex random suffix
+        # by default. Traces contain that internal ID, not the HTTP response ID.
         for rid in request_ids:
             key = rid + "-0"
             if key in owners:
@@ -139,18 +142,33 @@ def accuracy_report(trace_directory, report):
         raise ValueError("No confidence traces found")
     unmatched = 0
     seen = set()
+    internal_ids = {}
     for path in files:
         with path.open() as stream:
             for line in stream:
                 row = json.loads(line)
-                if row["request_id"] not in owners:
+                internal_id = row["request_id"]
+                external_id = internal_id
+                if external_id not in owners:
+                    # Strip only the exact suffix used by this vLLM version.
+                    # Arbitrary prefix matching could include other requests.
+                    base, separator, suffix = internal_id.rpartition("-")
+                    if separator and re.fullmatch(r"[0-9a-f]{8}", suffix):
+                        external_id = base
+                if external_id not in owners:
                     unmatched += 1
                     continue
-                key = (row["request_id"], row["round_id"])
+                previous = internal_ids.setdefault(external_id, internal_id)
+                if previous != internal_id:
+                    raise ValueError(
+                        f"Multiple internal requests map to {external_id}; "
+                        "cannot unambiguously attribute confidence traces"
+                    )
+                key = (internal_id, row["round_id"])
                 if key in seen:
                     raise ValueError("Duplicate confidence trace record")
                 seen.add(key)
-                grouped[owners[row["request_id"]]].append(row)
+                grouped[owners[external_id]].append(row)
     if not any(grouped):
         raise ValueError(
             "No traces match measured request IDs; do not use warmup as benchmark accuracy"
@@ -163,6 +181,8 @@ def accuracy_report(trace_directory, report):
                 benchmark=c["benchmark"],
                 concurrency=c.get("concurrency", 1),
                 temperature=c["temperature"],
+                measured_requests=len(c["request_ids"]),
+                requests_with_traces=len({r["request_id"] for r in rows}),
                 **accuracy(rows),
             )
             for c, rows in zip(cells, grouped)
@@ -261,9 +281,13 @@ def compare_reports(baseline, candidate, expected_mode):
             for value in (
                 summary.get("tokens_per_second"),
                 old.get("tokens_per_second"),
+                summary.get("wall_tokens_per_second"),
+                old.get("wall_tokens_per_second"),
             ):
                 if value is None or not math.isfinite(value) or value <= 0:
-                    errors.append("Invalid throughput")
+                    errors.append(
+                        "Missing or invalid request-time or wall-clock throughput"
+                    )
         valid = not errors
         output.append(
             {
@@ -279,14 +303,25 @@ def compare_reports(baseline, candidate, expected_mode):
                 if previous
                 else None,
                 "tokens_per_second": summary.get("tokens_per_second"),
-                "speedup": summary["tokens_per_second"]
+                "baseline_wall_tokens_per_second": previous["summary"].get(
+                    "wall_tokens_per_second"
+                )
+                if previous
+                else None,
+                "wall_tokens_per_second": summary.get("wall_tokens_per_second"),
+                "speedup_metric": "wall_tokens_per_second",
+                "request_time_speedup": summary["tokens_per_second"]
                 / previous["summary"]["tokens_per_second"]
+                if valid
+                else None,
+                "speedup": summary["wall_tokens_per_second"]
+                / previous["summary"]["wall_tokens_per_second"]
                 if valid
                 else None,
                 "speedup_percent": 100
                 * (
-                    summary["tokens_per_second"]
-                    / previous["summary"]["tokens_per_second"]
+                    summary["wall_tokens_per_second"]
+                    / previous["summary"]["wall_tokens_per_second"]
                     - 1
                 )
                 if valid
@@ -309,29 +344,47 @@ def main():
     parser = argparse.ArgumentParser(__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     audit = commands.add_parser("accuracy")
-    audit.add_argument("--trace-dir", type=Path, required=True)
+    audit.add_argument(
+        "--trace-dir",
+        type=Path,
+        help="Defaults to the trace directory in run_info.json's saved server manifest",
+    )
     audit.add_argument("--run-info", type=Path, required=True)
     audit.add_argument("--output", type=Path, required=True)
     compare = commands.add_parser("compare")
     compare.add_argument("--baseline", type=Path, required=True)
     compare.add_argument("--observe", type=Path)
-    compare.add_argument("--cut", type=Path, required=True)
+    compare.add_argument("--cut", type=Path)
     compare.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "accuracy":
-        result = accuracy_report(args.trace_dir, json.loads(args.run_info.read_text()))
+        report = json.loads(args.run_info.read_text())
+        trace_dir = args.trace_dir
+        if trace_dir is None:
+            confidence = (report.get("server_manifest") or {}).get(
+                "dspark_confidence"
+            ) or {}
+            trace_dir = confidence.get("trace_directory")
+        if not trace_dir:
+            parser.error("No saved confidence trace directory; supply --trace-dir")
+        result = accuracy_report(trace_dir, report)
     else:
+        if not args.observe and not args.cut:
+            parser.error("Supply at least one of --observe or --cut")
         baseline = json.loads(args.baseline.read_text())
         rows = []
         if args.observe:
             rows += compare_reports(
                 baseline, json.loads(args.observe.read_text()), "observe"
             )
-        rows += compare_reports(baseline, json.loads(args.cut.read_text()), "cut")
+        if args.cut:
+            rows += compare_reports(baseline, json.loads(args.cut.read_text()), "cut")
         result = {
-            "schema": "dspark_confidence_speed_v1",
+            "schema": "dspark_confidence_speed_v2",
             "cells": rows,
-            "note": "Speedup is measured throughput / confidence-off throughput, with identical greedy output hashes.",
+            "note": "Speedup uses total output tokens / elapsed wall time, relative to confidence off, "
+            "with identical greedy output hashes. The legacy tokens_per_second field divides by "
+            "summed request times; its ratio is reported separately as request_time_speedup.",
         }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")

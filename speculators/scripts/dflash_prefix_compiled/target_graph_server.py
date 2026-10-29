@@ -116,6 +116,7 @@ def checkpoint(draft, target, method="auto", proposals="auto", draft_enforce_eag
     spec = {
         "method": method, "model": str(draft), "num_speculative_tokens": proposals,
         "draft_sample_method": "greedy", "disable_padded_drafter_batch": False,
+        "rejection_sample_method": "standard",
         "enable_adaptive_verification": False,
     }
     override = eager_override(draft_enforce_eager)
@@ -386,6 +387,12 @@ def command_and_record(args):
         "command": command, "compilation_config": compilation, "speculative_config": spec,
         "additional_config": additional, "selector_environment": {
             k: v for k, v in env.items() if k.startswith("DFLASH_PREFIX_")
+        },
+        "determinism_environment": {
+            key: env.get(key) for key in (
+                "VLLM_BATCH_INVARIANT", "HCCL_DETERMINISTIC", "LCCL_DETERMINISTIC",
+                "ATB_MATMUL_SHUFFLE_K_ENABLE", "ATB_LLM_LCOC_ENABLE", "PYTHONHASHSEED",
+            )
         },
         "graph_metrics": bool(args.graph_metrics), "check_only": bool(args.check_only),
         "max_num_seqs": max_num_seqs,

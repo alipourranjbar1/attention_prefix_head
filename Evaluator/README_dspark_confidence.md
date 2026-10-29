@@ -52,6 +52,134 @@ through `PYTHONPATH`; no compiled kernels are changed.
 
 ## Run
 
+### Full cached benchmark suite with repeated timing
+
+Use `serve_dspark_full_suite.sh off` in the server terminal and then
+`eval_dspark_full_suite.sh` in the client terminal. After the three OFF passes
+finish, stop the server and start `serve_dspark_full_suite.sh cut`. Run the same
+client again for the three ON passes. Server startup prepares one independent
+full prompt manifest. It first reuses complete splits from
+`Evaluator/retrace_eval_prompts.json`, checking the target configuration,
+tokenizer fingerprints, thinking mode, token hashes and unique source-row
+coverage. That file already holds all 880 LiveCodeBench v5 prompts, so its raw
+JSONL files do not need to exist in the Hugging Face cache. Partial splits
+are rebuilt in full from offline sources;
+the 128-prompt manifest is never accepted as full coverage. Missing datasets
+stop preparation before inference; none are silently omitted. Reuse provenance
+and the original formatting choices are recorded in the new manifest.
+
+The suite covers GSM8K test, MATH-500 test, HumanEval test, sanitized MBPP test,
+LiveCodeBench release v5, AIME25, and MT-Bench first user turns. Alpaca is
+excluded from preparation, evaluation, and reporting. The exact counts are
+printed during preparation. All runs use greedy decoding, the configured
+concurrency, seven maximum proposals, and a default output cap of 2,048 tokens.
+The maximum context and unchunked-prefill token budget are chosen once from the
+longest full-dataset prompt plus that cap and the speculative safety margin,
+then kept identical in both modes. Prompts are not silently truncated.
+
+`CONCURRENCY` defaults to 64 and sets both client concurrency and server
+`max_num_seqs`. `SUITE_DIR` defaults to
+`output/dspark_full_benchmark_c${CONCURRENCY}` under the repository.
+`REPEATS` defaults to 3 and must be at least 1; `MAX_NEW_TOKENS` defaults to 2048.
+With one pass, standard deviation and within-mode repeat agreement are unavailable.
+Use the same preparation settings for both server launches. If full sources
+require explicit paths, run the suite Python `prepare` command with repeated
+`--source DATASET=LOCAL_PATH` arguments before starting the server. Both
+launchers otherwise use the model, CANN, NPU 7, and port 8217 settings above.
+Explicit sources take priority over saved splits. Use `REUSE_MANIFEST` to point
+the server wrapper at another prepared manifest, or `--reuse-manifest` with the
+Python preparation command. A model/tokenizer mismatch stops reuse rather than
+silently mixing incompatible token IDs.
+
+To repeat the experiment at concurrency 128, use
+`CONCURRENCY=128 bash Evaluator/serve_dspark_full_suite.sh off` in the server
+terminal and `CONCURRENCY=128 bash Evaluator/eval_dspark_full_suite.sh` in the
+client terminal. After OFF finishes, stop the server, start it with `cut`, and
+run the same client command again. Both modes retain three repeats, seven
+proposals, and the same execution settings. The wrapper prefers the completed
+concurrency-64 suite's frozen `prompts.json` when available, then falls back to
+the repository's saved prompts. Concurrency-128 results go to a separate suite;
+an explicit `SUITE_DIR` pointing at a suite with other settings is rejected.
+AIME25 has only 30 prompts and MT-Bench has 80, so they cannot reach 128
+simultaneous distinct requests. Their rows are not duplicated to fill slots.
+
+The client resumes completed repeats from the suite's run index. Failed partial
+attempts remain on disk and are not indexed as complete. No existing run is
+overwritten. Change `SUITE_DIR` to start an independent experiment. Reports are:
+
+- `suite_report.csv`: per-benchmark OFF/ON wall throughput means and standard
+  deviations, descriptive throughput ratio, same-mode output agreement,
+  cross-mode output agreement, and strict comparison status.
+- `suite_report.json`: all repeat metrics, length-limited request counts,
+  every mismatching request index, and the first token divergence for up to
+  20 mismatch examples per paired repeat per benchmark.
+- `suite_report.md`: compact results and limitations for review.
+- `runs/*/generations/*.jsonl.gz`: generated token IDs, text, finish reasons,
+  source IDs, and timings saved after each measured dataset interval.
+
+Output differences remain visible even if the dataset is larger. Descriptive
+ratios are separated from strict, identical-output-validated speedups. Means
+and standard deviations from grouped-mode repeats are not confidence intervals
+or a counterbalanced experiment. The geometric mean gives each benchmark
+equal weight in the summary. HumanEval/MBPP/LCB
+generated code is never executed; this suite measures performance and output
+agreement, not answer correctness or pass@1.
+
+### Two timing runs at concurrency 64
+
+`run_dspark_speed_server.sh off` starts the full seven-proposal baseline.
+`run_dspark_speed_server.sh cut` enables confidence computation and shortens
+verification according to its policy. These use the local Qwen3-4B target and
+native block7 checkpoint, NPU 7, port 8217, capacity 64, and identical eager
+execution settings. Neither enables diagnostic tracing. The launcher creates
+its own unique run directory and log; do not precreate the directory.
+
+Keep the server in one terminal, then run `eval_dspark_speed.sh` in another
+after startup. It submits 128 frozen GSM8K prompts with concurrency 64. Stop
+the server, start the other mode, and run the same evaluator again. After both
+complete, the second result directory contains `speed_comparison.json` and
+`.csv`: `speedup` is head-on (`cut`) aggregate throughput divided by head-off
+aggregate throughput. Head off still uses DSpark drafting and Markov sampling.
+The client rejects traced accuracy servers and reports only validated matched
+comparisons. Run directories and earlier results are retained.
+
+### Separate server and evaluator for the released Qwen3-4B block7 checkpoint
+
+`serve_dspark4b_confidence.sh` uses the local Qwen3-4B target and
+`/share/canada_group_folder/ckpt/dspark_qwen3_4b_block7`, NPU 7, port 8217,
+eager execution, and **exactly seven proposals**, overriding inherited values.
+It runs the server in the foreground and displays its startup log. The
+evaluator never starts or stops a server. Both scripts can be run from any
+working directory; their default `ROOT` is the user's existing repository.
+
+```bash
+# Terminal 1: keep running until you want to switch modes.
+bash Evaluator/serve_dspark4b_confidence.sh observe accuracy
+
+# Terminal 2: run after server startup finishes.
+bash Evaluator/evaluate_dspark4b_confidence.sh
+```
+
+The server takes two arguments: `off|observe|cut` and `accuracy|speed`.
+Accuracy collection supports `observe` and `cut`; `off` is used for timing.
+Stop the server with Ctrl+C between modes, then restart it with new arguments.
+Run the same evaluator command for every mode. It discovers the exact launch
+record and generates confidence metrics only when tracing is enabled.
+
+For speed, run `off speed`, `observe speed`, and `cut speed` separately and
+evaluate each. Once all three have completed, the evaluator compares the latest
+timing results for that concurrency using the existing strict comparison checks.
+Results are retained under `output/dspark4b_manual/c<concurrency>/`; only the
+bookmarks to the latest timing results are updated. Accuracy results are never
+used as timing baselines. The evaluator checks readiness once and tells you to
+inspect the server terminal if it is not ready.
+
+For concurrency 128, launch with `MAX_NUM_SEQS=128` and evaluate with
+`CONCURRENCY=128`. Both defaults are 1. `NUM_PROMPTS` defaults to 128 and
+`MAX_NEW_TOKENS` to 2048; use 4 and 256 for a short smoke run.
+
+### Automated comparison for other checkpoints
+
 Activate the existing Ascend environment and select matching model directories:
 
 ```bash
@@ -155,7 +283,20 @@ censored; the full-block subset in this file is not an unbiased head-accuracy
 estimate. Use `confidence_accuracy.json` for overall head accuracy.
 
 Trace request IDs are matched to measured evaluator requests, excluding warmup
-and unrelated traffic. EOS rounds are excluded from accuracy. If a shortened
+and unrelated traffic. The report supports both the completion ID plus `-0`
+and the additional eight-character hexadecimal suffix that vLLM appends to
+internal request IDs. It rejects ambiguous mappings and duplicate trace rounds;
+it never includes all traces as a fallback. `measured_requests` and
+`requests_with_traces` show matching coverage in each report cell. Requests
+that finish before a speculative round may have no traces.
+
+If generation completed but confidence reporting failed, update
+`dspark_confidence_report.py` and rerun only the report on the saved
+`run_info.json`. The trace directory is recovered from that run's embedded
+server manifest when `--trace-dir` is omitted. This needs neither a running
+server nor an NPU and does not repeat inference. Keep the saved trace files.
+
+EOS rounds are excluded from accuracy. If a shortened
 prefix is fully accepted, its unverified suffix usually has no label. A target
 bonus differing from the next proposal exposes an exact boundary; otherwise
 the full label stays null/censored, unless the bonus confirms the last proposal
@@ -169,6 +310,17 @@ hashes, sampling/runtime settings and metric isolation must match before a
 speedup is reported. No speed gain is assumed; repeat measurements before
 drawing performance conclusions.
 
+Speed schema v2 uses `wall_tokens_per_second` (total output tokens divided by
+elapsed benchmark wall time) for `speedup`. The evaluator's legacy
+`tokens_per_second` divides by the sum of individual request durations, which
+overlap under concurrency; it is not aggregate server throughput. That ratio
+is retained separately as `request_time_speedup`. Existing `run_info.json`
+files already contain both measurements, so comparison can be regenerated
+without repeating inference. Diagnostic traced runs remain excluded.
+
+The report's `compare` command accepts `--baseline` plus either `--observe`,
+`--cut`, or both. Thus head-off versus head-on timing does not require a cut run.
+
 ## Validation
 
 The existing dynamic call passed the whole backbone tensor, potentially
@@ -179,6 +331,7 @@ synchronization. Request IDs bind rows across reordering. No extra D2H event or
 per-request device `.item()` is added for this transfer; trace I/O is diagnostic.
 
 ```bash
+python Evaluator/tests/test_dspark_confidence_report.py
 python vllm-ascend/tests/ut/spec_decode/test_dspark_confidence_standalone.py
 python vllm-ascend/tests/ut/spec_decode/test_linear_confidence_standalone.py
 

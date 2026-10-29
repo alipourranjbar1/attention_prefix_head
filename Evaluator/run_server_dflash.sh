@@ -52,9 +52,20 @@ RUN_DIR="${RUN_DIR:-$SPEC_MAIN/output/evaluator_server_$(date +%Y%m%d_%H%M%S)_$$
 [[ -x "$PYTHON_BIN" ]] || { echo "Missing Python: $PYTHON_BIN" >&2; exit 1; }
 [[ "$CHECK_ONLY" == 0 || "$CHECK_ONLY" == 1 ]] || { echo "CHECK_ONLY must be 0 or 1" >&2; exit 1; }
 unset PYTHONPATH ASCEND_LAUNCH_BLOCKING TORCH_COMPILE_DISABLE TORCHDYNAMO_DISABLE
+# Preserve explicit caller settings across CANN/ATB setup, which can reset them.
+REQUESTED_DETERMINISM_ENV=()
+for env_name in VLLM_BATCH_INVARIANT HCCL_DETERMINISTIC LCCL_DETERMINISTIC \
+    ATB_MATMUL_SHUFFLE_K_ENABLE ATB_LLM_LCOC_ENABLE PYTHONHASHSEED; do
+    if [[ -v "$env_name" ]]; then
+        REQUESTED_DETERMINISM_ENV+=("$env_name=${!env_name}")
+    fi
+done
 if [[ "$CHECK_ONLY" == 0 ]]; then
     source "${CANN_ENV_SH:-$CANN_ROOT/ascend-toolkit/set_env.sh}"
     source "${ATB_ENV_SH:-$CANN_ROOT/nnal/atb/set_env.sh}"
+fi
+if (( ${#REQUESTED_DETERMINISM_ENV[@]} )); then
+    export "${REQUESTED_DETERMINISM_ENV[@]}"
 fi
 # Use CANN's platform selection; do not hard-code an A3 SOC on A2.
 export PYTHONPATH="$SPEC_MAIN/vllm:$SPEC_MAIN/vllm-ascend:$SPEC_MAIN/speculators/src:$SPEC_MAIN/speculators/hs_connectors/src:${PYTHONPATH:-}"

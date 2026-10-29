@@ -51,6 +51,7 @@ python evaluator.py \
 
 import argparse
 import csv
+import gzip
 import hashlib
 import json
 import math
@@ -353,7 +354,10 @@ def prepare_manifest(args, names):
             name, sources.get(name), args.offline, args.lcb_release
         )
         indices = list(range(len(rows)))
-        requested_count = args.num_prompts if args.num_prompts > 0 else COUNTS[name]
+        requested_count = (
+            len(rows) if getattr(args, "all_prompts", False)
+            else args.num_prompts if args.num_prompts > 0 else COUNTS[name]
+        )
         if len(rows) > requested_count:
             random.Random(args.prompt_seed).shuffle(indices)
         indices = indices[:requested_count]
@@ -434,6 +438,37 @@ def select_prompts(manifest, names, limit, thinking):
                 raise ValueError(f"Manifest token hash mismatch in {name}")
         chosen[name] = rows
     return chosen
+
+
+def require_full_manifest(manifest, names):
+    """Reject sampled/duplicate prompt manifests when every source row is requested."""
+    for name in names:
+        dataset = manifest["datasets"][name]
+        count = dataset.get("source_rows")
+        rows = dataset["results"]
+        if not isinstance(count, int) or count <= 0 or len(rows) != count:
+            raise ValueError(f"{name}: --all-prompts requires all source rows; create a new full manifest")
+        if sorted(row.get("source_row", -1) for row in rows) != list(range(count)):
+            raise ValueError(f"{name}: full manifest has missing or duplicated source rows")
+
+
+def save_generations(output, name, temperature, concurrency, rows):
+    """Persist outputs after the timed interval; never execute generated programs."""
+    relative = Path("generations") / f"{name}_t{temperature:g}_c{concurrency}.jsonl.gz"
+    path = output / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = (
+        "source_row", "source_id", "prompt_sha256", "request_id", "output_token_ids",
+        "finish_reason", "text", "completion_tokens", "latency_seconds",
+        "request_started_monotonic_s", "request_finished_monotonic_s",
+        "first_token_monotonic_s", "last_token_monotonic_s",
+    )
+    with gzip.open(path, "xt", encoding="utf-8") as stream:
+        for index, row in enumerate(rows):
+            record = {key: row.get(key) for key in fields}
+            record["index"] = index
+            stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+    return str(relative)
 
 
 def normalize_url(value):
@@ -605,7 +640,10 @@ class Client:
                 raise RuntimeError(
                     f"HTTP {response.status_code}: {response.text[:1500]}"
                 )
-            for raw in response.iter_lines(chunk_size=1):
+            # Consume SSE HTTP chunks without a Python iteration for every byte.
+            # Chunked HTTP responses yield short chunks immediately; an SSE event
+            # need not fill this buffer before it is delivered.
+            for raw in response.iter_lines(chunk_size=1024):
                 if not raw or not raw.startswith(b"data:"):
                     continue
                 data = raw[5:].strip()
@@ -631,7 +669,8 @@ class Client:
                         token_ids.extend(delta)
                     texts.append(choice.get("text") or "")
                     finish = choice.get("finish_reason") or finish
-        latency = time.perf_counter() - started
+        finished = time.perf_counter()
+        latency = finished - started
         if not done or usage is None or finish not in ("stop", "length"):
             raise RuntimeError(
                 f"Incomplete generation: done={done}, usage={usage}, finish={finish}"
@@ -650,6 +689,10 @@ class Client:
             "prompt_tokens": len(tokens),
             "completion_tokens": len(token_ids),
             "latency_seconds": latency,
+            "request_started_monotonic_s": started,
+            "request_finished_monotonic_s": finished,
+            "first_token_monotonic_s": first,
+            "last_token_monotonic_s": last,
             "ttft_seconds": first - started if first else None,
             "tpot_seconds": (last - first) / (len(token_ids) - 1)
             if first and len(token_ids) > 1
@@ -899,6 +942,7 @@ SUMMARY_FIELDS = [
     "benchmark",
     "requests",
     "tokens_per_second",
+    "wall_tokens_per_second",
     "acceptance_length_with_bonus_pooled",
     "acceptance_length_with_bonus_request_mean",
     "draft_acceptance_rate",
@@ -1190,9 +1234,14 @@ def read_server_manifest(path, client, target_config_hash):
     print(f"Prefix mode={manifest.get('prefix_mode')}; graph={manifest['prefix_npu_graph']}; "
           f"token_cache={manifest['prefix_token_cache']}", flush=True)
     if "target_execution_requested" in manifest:
+        confidence = manifest.get("dspark_confidence") or {}
+        verification = (
+            "confidence-selected proposal prefix; target verification enabled"
+            if confidence.get("mode") == "cut" else "full proposal verification"
+        )
         print(f"Target execution requested: {manifest['target_execution_requested']}; "
               f"draft execution requested: {manifest.get('draft_execution_requested', 'eager')}; "
-              "full target verification retained.", flush=True)
+              f"{verification}.", flush=True)
         if manifest.get("draft_backend_note"):
             print(manifest["draft_backend_note"], flush=True)
     return manifest
@@ -1354,6 +1403,10 @@ def main():
         help="Requests per selected dataset; 0 uses the dataset default",
     )
     p.add_argument("--source", action="append", default=[])
+    p.add_argument("--all-prompts", action="store_true",
+                   help="Prepare/use every source row; rejects an existing sampled manifest")
+    p.add_argument("--save-generations", action="store_true",
+                   help="Save compressed generated tokens/text after timing for output-parity diagnostics")
     p.add_argument("--offline", action="store_true")
     p.add_argument("--lcb-release", type=int, default=5)
     p.add_argument(
@@ -1448,6 +1501,8 @@ def main():
 
     if args.num_prompts < 0:
         p.error("--num-prompts must be >= 0")
+    if args.all_prompts and args.num_prompts:
+        p.error("--all-prompts cannot be combined with a positive --num-prompts")
     if args.max_new_tokens < 1:
         p.error("--max-new-tokens must be >= 1")
     if args.max_sequence_length < 0:
@@ -1489,6 +1544,8 @@ def main():
 
     names = names_from(args.datasets)
     manifest = prepare_manifest(args, names)
+    if args.all_prompts:
+        require_full_manifest(manifest, names)
     selected = select_prompts(
         manifest,
         names,
@@ -1574,6 +1631,7 @@ def main():
         "resolved_sampling": resolved_sampling,
         "sampling_protocol": "manual-vllm",
         "stream": True,
+        "http_read_chunk_size": 1024,
         "n": 1,
         "target_weight_identity": (server_manifest or {}).get("target_sha256"),
         "runtime_identity": (
@@ -1594,6 +1652,7 @@ def main():
                     "draft_enforce_eager",
                     "compilation_config",
                     "additional_config",
+                    "determinism_environment",
                 )
             }
             if server_manifest
@@ -1742,8 +1801,12 @@ def main():
                     cell["output_hashes"] = [hashlib.sha256(json.dumps(
                         [r["output_token_ids"], r["finish_reason"]], separators=(",", ":")
                     ).encode()).hexdigest() for r in rows]
-                    # Per-request rows are needed only transiently for aggregation/reference checks.
-                    # Do not retain or write them after this dataset is summarized.
+                    if args.save_generations:
+                        cell["generations_file"] = save_generations(
+                            output, name, temperature, concurrency, rows
+                        )
+                    # Keep run_info compact; optional generation files retain
+                    # per-request outputs separately after the timed interval.
                     cell.pop("results", None)
                     cell.pop("prometheus_delta", None)
                     report["cells"].append(cell)
