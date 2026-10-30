@@ -69,7 +69,7 @@ def test_ascend_recipe_matches_user_settings(tmp_path):
     env = {"MODEL": str(model), "DATASET": str(data), "OUTPUT_DIR": str(tmp_path / "out"),
            "TARGET_NPUS": "0,1", "TRAIN_NPUS": "2,3,4,5,6,7", "MAX_ANCHORS": "512"}
     cfg = build_config(env)
-    assert (cfg.epochs, cfg.learning_rate, cfg.max_sequence_length) == (5, 0.0006, 6144)
+    assert (cfg.epochs, cfg.learning_rate, cfg.max_sequence_length) == (5, 0.0006, 9216)
     assert cfg.max_anchors == 512  # explicit environment override in this fixture
     assert cfg.distributed_strategy == "fsdp"
     assert (cfg.num_anchors, cfg.num_proposals, cfg.num_draft_layers) == (4, 16, 5)
@@ -79,7 +79,7 @@ def test_ascend_recipe_matches_user_settings(tmp_path):
     with pytest.raises(ValueError, match="disjoint"):
         build_config({**env, "TRAIN_NPUS": "1,2"})
     default_env = {k: v for k, v in env.items() if k != "MAX_ANCHORS"}
-    assert build_config(default_env).max_anchors == 1024
+    assert build_config(default_env).max_anchors == 1536
     legacy = build_config({**env, "DISTRIBUTED_STRATEGY": "ddp", "SEQ_LENGTH": "3072", "PORT": "8080"})
     assert (legacy.distributed_strategy, legacy.max_sequence_length) == ("ddp", 3072)
     with pytest.raises(ValueError, match="at least two"):

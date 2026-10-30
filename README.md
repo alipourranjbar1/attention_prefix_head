@@ -33,9 +33,9 @@ Existing exported `MODEL` and `DATASET` values take precedence. The launcher val
 | Draft | Five regular bidirectional DFlash layers |
 | Conditioning anchors | 4 |
 | New tokens per pass | 16; 20 query positions total |
-| Packed token budget | **6144 per trainer rank**, up to 36,864 across six trainers |
+| Packed token budget | **9216 per trainer rank** (3 × 3072), up to 55,296 across six trainers |
 | Training / held-out split | 90% / 10%; `TRAIN_DATA_RATIO` overrides |
-| Training blocks | Up to **1024 per trainer rank** (`MAX_ANCHORS`), 6144 across six trainers |
+| Training blocks | Up to **1536 per trainer rank** (3 × 512; `MAX_ANCHORS`), 9216 across six trainers |
 | Loss on both passes | **0.1 CE + 0.9 TV**, full target vocabulary |
 | Optimizer | AdamW, unchanged; DSpark loss does not select Muon |
 | Epochs | 5 shuffled passes over the training split |
@@ -46,11 +46,11 @@ Existing exported `MODEL` and `DATASET` values take precedence. The launcher val
 | Progress bar | Rank 0 shows steps, percentage, elapsed time, ETA, loss and epoch |
 | Target server / trainer rendezvous ports | 8093 / 29647 (`PORT` / `MASTER_PORT`) |
 
-The model remains five bidirectional regular DFlash layers. **Four** is the number of conditioning tokens inside each block; **1024** is the maximum number of sampled prediction starts in one packed batch. Each start creates 4 anchor slots plus 16 generation slots. Anchor slots have no loss.
+The model remains five bidirectional regular DFlash layers. **Four** is the number of conditioning tokens inside each block; **1536** is the maximum number of sampled prediction starts in one packed batch. Each start creates 4 anchor slots plus 16 generation slots. Anchor slots have no loss.
 
-Training now uses the repository's `MultipackDistributedBatchSamplerV2`: it packs whole documents up to **6144 tokens per rank**, resets their positions and blocks cross-document attention. Like that sampler, it can drop fewer than `world_size` trailing rows to keep ranks synchronized. Rows are shuffled each epoch. The 90% training split is deterministic; held-out rows are excluded from optimization. Set `TRAIN_DATA_RATIO=1` only if the comparison baseline also trains on the full dataset.
+Training now uses the repository's `MultipackDistributedBatchSamplerV2`: it packs whole documents up to **9216 tokens per rank**, resets their positions and blocks cross-document attention. Like that sampler, it can drop fewer than `world_size` trailing rows to keep ranks synchronized. Rows are shuffled each epoch. The 90% training split is deterministic; held-out rows are excluded from optimization. Set `TRAIN_DATA_RATIO=1` only if the comparison baseline also trains on the full dataset.
 
-The dataset directory ending in `seq3072` is still used: the packer combines independent documents into the larger per-rank budget. It does not create 6144-token single-document continuations. The previous 3072 setting was also **per rank**, not shared across all six trainers. Step counts are recalculated for the new packing budget.
+The dataset directory ending in `seq3072` is still used: the packer combines independent documents into the larger per-rank budget. It does not create 9216-token single-document continuations. The previous 3072 setting was also **per rank**, not shared across all six trainers. Step counts are recalculated for the new packing budget.
 
 `DISTRIBUTED_STRATEGY=fsdp` now selects actual PyTorch FSDP `FULL_SHARD`, with FP32 master parameters/optimizer states sharded across trainer NPUs, BF16 compute and FP32 gradient reduction. The frozen target embedding, LM head and final norm remain replicated. A single FSDP wrapper encloses the entire `PackedTask`: ranks may execute different numbers of block chunks or redrafts, so decoder-layer auto-wrapping would risk mismatched collectives. The complete draft's compute weights are temporarily gathered during a step; FSDP does not shard activations or the per-rank token batch. Gradient clipping uses FSDP's global norm.
 
@@ -83,7 +83,7 @@ DFLASH_INIT=/path/to/regular-dflash CHECK_ONLY=0 bash four_anchor/scripts/train_
 
 The run directory is `output/four_anchor_dflash_<timestamp>_<pid>/`. Logs are `train.log`, `target_server.log`, and `checkpoints/logs/four_anchor_dflash/`; the resolved configuration is `train_config.json`. The launcher owns and shuts down only its target-server process group. The packed implementation is tested on CPU, including BF16 resume and exact greedy decoding after training. FSDP state/optimizer conversion and continuation are tested with real FSDP module APIs in single-rank NO_SHARD mode using in-process fake collectives. Actual multi-rank FULL_SHARD/HCCL and throughput must pass the included server-side check; they could not be executed here because Gloo sockets are blocked.
 
-The training JSON log includes rank-zero `memory_allocated_gib`, `memory_reserved_gib` and `peak_memory_allocated_gib` (each prefixed `rank0_`). Process memory reported by `npu-smi` can also include runtime/cache overhead. The block and head chunk sizes plus checkpointing reduce memory compared with a fully materialized loss; 10–15 GB alone does not show that supervision is missing. At the new limits and accumulation 1, global `training_blocks` can reach 6144 (1024 per rank), provided each batch has enough eligible positions.
+The training JSON log includes rank-zero `memory_allocated_gib`, `memory_reserved_gib` and `peak_memory_allocated_gib` (each prefixed `rank0_`). Process memory reported by `npu-smi` can also include runtime/cache overhead. The block and head chunk sizes plus checkpointing reduce memory compared with a fully materialized loss; 10–15 GB alone does not show that supervision is missing. At the new limits and accumulation 1, global `training_blocks` can reach 9216 (1536 per rank), provided each batch has enough eligible positions.
 
 ## Exact algorithm
 

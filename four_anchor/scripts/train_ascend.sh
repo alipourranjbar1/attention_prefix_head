@@ -26,10 +26,10 @@ unset ASCEND_LAUNCH_BLOCKING DFLASH_TP_GATHER
 export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="localhost,127.0.0.1,::1"
 export SOC_VERSION="${SOC_VERSION:-ascend910_9372}"
 export TARGET_NPUS="${TARGET_NPUS:-0,1}" TRAIN_NPUS="${TRAIN_NPUS:-2,3,4,5,6,7}"
-export PORT="${PORT:-8093}" SEQ_LENGTH="${SEQ_LENGTH:-6144}" BLOCK_SIZE="${BLOCK_SIZE:-16}"
+export PORT="${PORT:-8093}" SEQ_LENGTH="${SEQ_LENGTH:-9216}" BLOCK_SIZE="${BLOCK_SIZE:-16}"
 export EPOCHS="${EPOCHS:-5}" LR="${LR:-0.0006}" SEED="${SEED:-42}"
 export GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-1}" LOG_FREQ="${LOG_FREQ:-10}"
-export MAX_ANCHORS="${MAX_ANCHORS:-1024}"  # sampled blocks per packed batch; four anchors inside each block
+export MAX_ANCHORS="${MAX_ANCHORS:-1536}"  # sampled blocks per packed batch; four anchors inside each block
 export DISTRIBUTED_STRATEGY="${DISTRIBUTED_STRATEGY:-fsdp}"
 export NUM_WORKERS="${NUM_WORKERS:-4}" TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.9}"
 export BLOCKS_PER_CHUNK="${BLOCKS_PER_CHUNK:-32}" HEAD_CHUNK_SIZE="${HEAD_CHUNK_SIZE:-64}"

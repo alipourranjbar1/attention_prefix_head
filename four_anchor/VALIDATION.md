@@ -45,7 +45,7 @@ weights are included.
 
 ## FSDP update
 
-The Ascend defaults are now FULL_SHARD, 6144 packed tokens and up to 1024 training
+The Ascend defaults are now FULL_SHARD, 9216 packed tokens and up to 1536 training
 blocks **per training NPU**. Four conditioning anchors and sixteen proposals per
 pass are unchanged. Frozen teacher modules remain replicated.
 
