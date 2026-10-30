@@ -29,35 +29,39 @@ Existing exported `MODEL` and `DATASET` values take precedence. The launcher val
 |---|---|
 | Target NPUs | `0,1`, vLLM data parallel size 2 |
 | Trainer NPUs | `2,3,4,5,6,7`, six DDP ranks |
-| Target model on trainer cards | Frozen embeddings and LM head only; no full target transformer |
+| Target model on trainer cards | Frozen embeddings, final norm and LM head; no full target transformer |
 | Draft | Five regular bidirectional DFlash layers |
 | Conditioning anchors | 4 |
 | New tokens per pass | 16; 20 query positions total |
-| Sequence length | 3072 |
-| Epochs | 5 complete shuffled passes over trainable dataset rows |
+| Packed token budget | 3072 per trainer rank |
+| Training / held-out split | 90% / 10%; `TRAIN_DATA_RATIO` overrides |
+| Training blocks | Up to 512 per packed batch (`MAX_ANCHORS`) |
+| Loss on both passes | **0.1 CE + 0.9 TV**, full target vocabulary |
+| Optimizer | AdamW, unchanged; DSpark loss does not select Muon |
+| Epochs | 5 shuffled passes over the training split |
 | Learning rate / schedule | 0.0006 / cosine; 50 warmup optimizer steps by default |
 | Precision / seed | BF16 autocast with FP32 trainable/master weights / 42 |
-| Gradient accumulation | 1 sequence per rank per update by default; `GRADIENT_ACCUMULATION` overrides |
+| Gradient accumulation | 1 packed batch per rank per update; `GRADIENT_ACCUMULATION` overrides |
 | Checkpoints / logging | Every epoch plus final/early stop; TensorBoard and `train.log` |
 | Progress bar | Rank 0 shows steps, percentage, elapsed time, ETA, loss and epoch |
 | Target server port | 8080 |
 
-The supplied script's **causal final layer is not enabled**: this experiment remains regular DFlash. Its `MAX_ANCHORS=512` is a cap on sampled *training blocks*, not four conditioning tokens. The current reference trainer samples **one block per sequence**; it records the legacy value in `launch_settings.json` and explicitly reports that it is not applied. This has substantially less supervision per sequence than the old packed 512-block recipe, so these runs are not compute- or token-matched baselines.
+The model remains five bidirectional regular DFlash layers. **Four** is the number of conditioning tokens inside each block; **512** is the maximum number of sampled prediction starts in one packed batch. Each start creates 4 anchor slots plus 16 generation slots. Anchor slots have no loss.
 
-The new epoch mode visits every retained dataset row once per epoch per distributed partition (with the standard DistributedSampler padding of at most `world_size-1` repeated rows). Each row samples one valid prediction start. The final accumulation group uses its actual size, and resume restores the same epoch position and RNG state. `MAX_STEPS=10` can stop a short trial without changing the five-epoch cosine schedule; remove it when resuming a full run.
+Training now uses the repository's `MultipackDistributedBatchSamplerV2`: it packs whole documents up to 3072 tokens per rank, resets their positions and blocks cross-document attention. Like that sampler, it can drop fewer than `world_size` trailing rows to keep ranks synchronized. Rows are shuffled each epoch. The 90% training split is deterministic; held-out rows are excluded from optimization. Set `TRAIN_DATA_RATIO=1` only if the comparison baseline also trains on the full dataset.
 
-Before model allocation and distributed sampler creation, training excludes rows with no positive loss weight at positions `1 .. SEQ_LENGTH-1` after truncation. This fixes the observed crash on dataset row `1218977`; no individual rank skips an optimizer step. The Arrow scan creates a small shared index cache under `output/.four_anchor_data_cache` (`DATA_CACHE_DIR` overrides), leaving the source dataset unchanged. A file lock allows one scan across all six ranks; subsequent runs reuse the cache for the same dataset fingerprint and sequence length. The console and provenance report input, retained, and dropped row counts. Epoch length and the cosine schedule use the retained count. Malformed masks still fail explicitly. A dataset entirely without usable supervision fails before model allocation.
+The launcher computes **actual steps for each epoch and all epochs** before starting the target server, and writes `checkpoints/packing_plan.json`. It does not hard-code 80,000 or shorten the dataset to force a count. The previous 1,183,640 bar counted all five epochs of an unpacked, one-row trainer. A packed count depends on token lengths, train split, worker count and accumulation. A 70–80k *per-epoch* count would mean 350–400k updates over five epochs. The 10–12 hour runtime must be measured on the NPUs.
 
-After applying this fix, start a new run if the previous run failed before its first checkpoint. Exact resume from a checkpoint whose dataset loses rows under the new filter is intentionally rejected because its sample order and epoch schedule differ. Resume between corrected runs remains supported, including with a different output/cache directory.
+The bar now reads `Epoch 1/5: ... current/steps_this_epoch`, with elapsed time and epoch ETA. Its postfix shows the global step and an estimated remaining time for the full run. JSON metrics and TensorBoard separately log first/second CE and TV (KL is diagnostic and has zero weight in the default loss). `SHOW_PROGRESS=0` hides only the bar. `MAX_STEPS` stops a trial without changing the five-epoch schedule.
 
-The progress bar covers all planned training updates, including all five epochs, and starts at the restored optimizer step on resume. Its ETA is estimated from observed update time and may fluctuate during warmup. With `MAX_STEPS`, it shows progress to that early-stop limit. Set `SHOW_PROGRESS=0` to disable the bar; JSON metrics and TensorBoard continue unchanged.
+Before packing, an Arrow scan filters rows without a supervised token after a nonempty prefix within 3072 tokens. This fixes the observed unsupervised-row crash without skipping individual DDP updates. Row indices, lengths and packing plans are cached under `output/.four_anchor_data_cache`; source data remains unchanged. Start a **fresh run** when switching from the old online objective; old optimizer checkpoints are not compatible with the new schedule/objective. Corrected packed runs support exact resume with per-rank RNG and FP32 master weights preserved.
 
-The trainer keeps target decoder output indices `[1,9,17,25,33]`, zero-based as documented below. The supplied vLLM source includes embedding slot 0, so the launcher requests capture slots `[2,10,18,26,34]` with `--no-include-last-layer`. This translation makes remote training and HF inference use the same actual layer outputs.
+The launcher requests vLLM capture slots `[2,10,18,26,34]` plus the final decoder output using `--include-last-layer`. The five drafter taps remain zero-based decoder indices `[1,9,17,25,33]`; vLLM numbers embedding as zero. The extra final state supplies the loss targets only: the frozen target final norm and LM head reconstruct its next-token distribution. The hidden state at token `t-1` supervises prediction of token `t`.
 
-Each training block makes two teacher requests: prefix features, then a greedy continuation from the actual retained first-pass proposal. The second request's states are discarded, and both request files are cleaned up. Token IDs are returned directly; the client never reconstructs them from text. Before six drafters are allocated, the launcher tests the live server's model ID, hidden-state shape, prompt alignment, and generated-token-ID response.
+Each document needs **one teacher prefill**, reused across its sampled blocks and both views. CPU workers prefetch those requests; no per-block autoregressive teacher rollout is performed. A live contract check verifies token alignment and both feature shapes before allocating the six trainers. Full-vocabulary losses are computed in checkpointed chunks (`HEAD_CHUNK_SIZE=64`); draft blocks are processed in groups (`BLOCKS_PER_CHUNK=32`) to bound attention memory.
 
 ```bash
-# Optional import/configuration checks only:
+# Optional imports, configuration and actual packing counts; no server/training:
 CHECK_ONLY=1 bash four_anchor/scripts/train_ascend.sh
 
 # Optional short run, then resume using its checkpoint and the same recipe:
@@ -69,7 +73,7 @@ RESUME=/path/to/run/checkpoints/checkpoint-000010 CHECK_ONLY=0 \
 DFLASH_INIT=/path/to/regular-dflash CHECK_ONLY=0 bash four_anchor/scripts/train_ascend.sh
 ```
 
-The run directory is `output/four_anchor_dflash_<timestamp>_<pid>/`. Logs are `train.log`, `target_server.log`, and `checkpoints/logs/four_anchor_dflash/`; the resolved configuration is `train_config.json`. The launcher owns and shuts down only its target-server process group. The supplied Ascend log confirms the live teacher check and training through step 30 before the unsupervised-row failure. The filter fix is tested on CPU; its full Ascend run remains to be validated.
+The run directory is `output/four_anchor_dflash_<timestamp>_<pid>/`. Logs are `train.log`, `target_server.log`, and `checkpoints/logs/four_anchor_dflash/`; the resolved configuration is `train_config.json`. The launcher owns and shuts down only its target-server process group. The packed implementation is tested on CPU, including BF16 resume and exact greedy decoding after training. Full six-rank Ascend training and wall-clock throughput remain to be validated on the server.
 
 ## Exact algorithm
 
@@ -174,11 +178,13 @@ NPROC_PER_NODE=4 bash four_anchor/scripts/train.sh \
 
 Regular DFlash warm starts accept local `config.json` plus safetensors (single or sharded). The importer checks model type, selected target layers, full vocabulary, and weight shapes. It rejects prefix-attention / MTP / other variant checkpoints. The new anchor interface and state projection require finetuning even when backbone weights are imported. Native four-anchor checkpoints use `--resume`, not `--initialize-dflash`.
 
-For each example, training runs the actual two-pass structure. The first block is trained against the dataset continuation. A boundary is selected by confidence, with geometric boundary exploration during training so an initially weak model does not always choose zero. The retained tokens and states are first-pass model outputs. A frozen target then rolls out a fresh continuation conditioned on that exact retained prefix, supplying the second-view labels. Those extra teacher states are **never passed to the drafter**. Both views use position-decayed CE in one normalized loss; no loss is applied to anchors or padding. First-pass states passed into the second view are detached.
+Both the supplied JSON config and Ascend launcher select `training_mode="packed"`. Each sampled start trains the first block against frozen target next-token distributions. The second view uses the same drafter and four preceding tokens/states. Its initial boundary uses the D-Loop confidence score, with optional geometric exploration; **during training only**, the retained length is capped at the first mismatch with dataset tokens and the document end. This makes the reused teacher-forced labels consistent with the retained prefix. Inference uses confidence alone. This is a documented training approximation, not an exact D-Loop reproduction.
 
-This teacher rollout is intentionally expensive: up to 16 incremental target calls per training example, plus processing the retained prefix and initial prefill. It avoids silently supervising the redraft with a continuation conditioned on a different prefix. `boundary_exploration=0` uses only the inference boundary rule; the default `0.5` also samples from the paper-inspired geometric distribution with `beta=0.7`.
+Both views minimize the requested **DSpark loss**, `0.1 * CE + 0.9 * TV`. CE uses the teacher distribution's argmax, exactly as the upstream loss does; TV is `1 - sum(min(p_target, p_draft))` over the complete vocabulary. Dataset loss masks and `exp(-position/7)` weight generation slots; the weighted sums of both views are normalized together. `LOSS_FN` can select `ce`, `tv`, or `kl_div` weights through the Ascend launcher. DSpark's RNN and confidence head are not included, so there is no confidence auxiliary loss. The optimizer remains AdamW at 0.0006.
 
-One example is processed per device per microstep. Gradient accumulation controls effective batch size. Distributed training uses DDP and gradient synchronization only on the final accumulation microstep. Trainable parameters/optimizer states stay float32; the bfloat16 setting uses autocast. Target weights remain frozen. The generic JSON config is step-based with random example/start sampling. Setting `epochs` instead enables shuffled dataset passes; the Ascend launcher above uses this mode. Neither objective claims to reproduce the paper's complementary training recipe.
+Only the original verified prefix supplies target feature memory in both views. Retained proposal anchors use detached first-pass draft states, never teacher states of the retained proposals. If a group's retained lengths are all zero, the two views have exactly the same inputs and targets; the trainer reuses the first computation with both loss weights instead of repeating it. Nonzero retained prefixes run the second drafter pass.
+
+DDP normalizes gradients by actual global supervised weight across all ranks and accumulation microbatches. Trainable weights and optimizer states remain FP32; BF16 uses autocast. Local-target training uses `num_workers=0`; the Ascend remote-teacher launcher uses four CPU workers per trainer rank. The previous `training_mode="online"` implementation remains available for controlled legacy experiments, but neither supplied default selects it.
 
 Checkpoints include model/config, optimizer, per-rank RNG state, source versions/hashes, command settings, dataset fingerprint, diffs, and model SHA256. Resume uses the same dataset, world size, model configuration, and total learning-rate schedule. Keep those settings fixed for reproducibility.
 

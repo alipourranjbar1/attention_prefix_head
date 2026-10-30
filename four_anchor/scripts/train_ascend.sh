@@ -29,7 +29,10 @@ export TARGET_NPUS="${TARGET_NPUS:-0,1}" TRAIN_NPUS="${TRAIN_NPUS:-2,3,4,5,6,7}"
 export PORT="${PORT:-8080}" SEQ_LENGTH="${SEQ_LENGTH:-3072}" BLOCK_SIZE="${BLOCK_SIZE:-16}"
 export EPOCHS="${EPOCHS:-5}" LR="${LR:-0.0006}" SEED="${SEED:-42}"
 export GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-1}" LOG_FREQ="${LOG_FREQ:-10}"
-export MAX_ANCHORS="${MAX_ANCHORS:-512}"  # recorded legacy value; NOT conditioning-anchor count
+export MAX_ANCHORS="${MAX_ANCHORS:-512}"  # sampled blocks per packed batch; four anchors inside each block
+export NUM_WORKERS="${NUM_WORKERS:-4}" TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.9}"
+export BLOCKS_PER_CHUNK="${BLOCKS_PER_CHUNK:-32}" HEAD_CHUNK_SIZE="${HEAD_CHUNK_SIZE:-64}"
+if [[ -z "${LOSS_FN:-}" ]]; then export LOSS_FN='{"ce":0.1,"tv":0.9}'; fi
 export OUTPUT_DIR="${OUTPUT_DIR:-$FOUR_ANCHOR_ROOT/output/four_anchor_dflash_$(date +%Y%m%d_%H%M%S)_$$}"
 export DATA_CACHE_DIR="${DATA_CACHE_DIR:-$FOUR_ANCHOR_ROOT/output/.four_anchor_data_cache}"
 cd "$FOUR_ANCHOR_ROOT"
@@ -50,8 +53,11 @@ assert importlib.util.find_spec('vllm') is not None, 'vLLM is not importable in 
 print('Preflight imports OK: regular DFlash, remote teacher client, TensorBoard', flush=True)
 PY
 python -m four_anchor.ascend_config
-printf 'This trainer samples ONE training block per sequence; legacy MAX_ANCHORS=%s is not applied.\n' "$MAX_ANCHORS"
+printf 'Packed token budget: %s per rank; up to %s sampled training blocks; loss=%s\n' "$SEQ_LENGTH" "$MAX_ANCHORS" "$LOSS_FN"
 printf 'Training layout: 4 conditioning anchors + %s new slots; all five draft layers bidirectional.\n' "$BLOCK_SIZE"
+IFS=',' read -r -a train_devices <<< "$TRAIN_NPUS"
+# Count real packed updates before starting either the target server or trainers.
+python -m four_anchor.packed_data --config "$OUTPUT_DIR/train_config.json" --world-size "${#train_devices[@]}"
 if [[ "${CHECK_ONLY:-0}" == 1 ]]; then exit 0; fi
 mkdir -p "$OUTPUT_DIR/hidden_states"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
@@ -74,7 +80,7 @@ trap 'exit 143' TERM
 # output of decoder i=i+1. Do NOT silently request 1,9,... for this checkpoint.
 setsid env ASCEND_RT_VISIBLE_DEVICES="$TARGET_NPUS" \
     python "$SPEC_DIR/scripts/launch_vllm.py" train "$MODEL" \
-    --target-layer-ids 2 10 18 26 34 --no-include-last-layer \
+    --target-layer-ids 2 10 18 26 34 --include-last-layer \
     --hidden-states-path "$OUTPUT_DIR/hidden_states" \
     --provenance-dir "$OUTPUT_DIR" -- \
     --served-model-name four-anchor-teacher --host 127.0.0.1 \

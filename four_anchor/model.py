@@ -204,8 +204,49 @@ class FourAnchorDFlash(nn.Module):
                  if not k.startswith(("embed_tokens.", "lm_head."))}
         save_file(state, str(path / "model.safetensors"))
 
+    def packed_hidden(self, features, context_positions, document_ids, anchors,
+                      starts, context_limits, block_documents):
+        """Independent blocks sharing packed context memory; no cross-document KV.
+
+        starts/context_limits are *document-relative* positions. Pass two moves
+        starts, but keeps the original context_limits: teacher states of the
+        retained proposals must never leak into either its queries or memory.
+        Returns [blocks, proposals, H], before the frozen vocabulary projection.
+        """
+        a, m = self.cfg.num_anchors, self.cfg.num_proposals
+        g = starts.numel()
+        device = features.device
+        masked = torch.full((g, m), self.cfg.mask_token_id, device=device, dtype=torch.long)
+        x = self.embed_tokens(torch.cat([anchors.ids, masked], -1))
+        tf = self.hidden_norm(self.fc(anchors.target_features))
+        df = self.draft_anchor_norm(self.draft_anchor_proj(anchors.draft_features))
+        feature = tf * (anchors.source == 1)[..., None] + df * (anchors.source == 2)[..., None]
+        x = (x + torch.cat([feature, torch.zeros_like(x[:, a:])], 1)).reshape(1, g * (a + m), -1)
+        context = self.hidden_norm(self.fc(features))
+        query_positions = torch.cat([anchors.positions, starts[:, None] + torch.arange(m, device=device)], -1)
+        positions = torch.cat([context_positions[None], query_positions.reshape(1, -1)], -1)
+        rope = self.rotary_emb(x, positions)
+        ctx_ok = ((document_ids[None] == block_documents[:, None]) &
+                  (context_positions[None] < context_limits[:, None]))
+        owners = torch.arange(g, device=device).repeat_interleave(a + m)
+        key_valid = torch.cat([anchors.source != 0, torch.ones_like(masked, dtype=torch.bool)], -1).flatten()
+        query_ok = (owners[:, None] == owners[None]) & key_valid[None]
+        allowed = torch.cat([ctx_ok.repeat_interleave(a + m, 0), query_ok], -1)
+        mask = torch.zeros((1, 1, *allowed.shape), device=device, dtype=x.dtype)
+        mask.masked_fill_(~allowed[None, None], torch.finfo(x.dtype).min)
+        for layer in self.layers:
+            def run(h, ctx, layer=layer):
+                return layer(hidden_states=h, target_hidden=ctx, attention_mask=mask,
+                             position_ids=positions, position_embeddings=rope, use_cache=False)
+            if self.gradient_checkpointing and self.training:
+                from torch.utils.checkpoint import checkpoint
+                x = checkpoint(run, x, context, use_reentrant=False)
+            else:
+                x = run(x, context)
+        return self.norm(x.reshape(g, a + m, -1)[:, a:])
+
     @classmethod
-    def load(cls, path, target):
+    def load(cls, path, target, trainable_dtype=None):
         path = Path(path)
         metadata = json.loads((path / "four_anchor_config.json").read_text())
         if metadata["architecture"] != "FourAnchorDFlash":
@@ -213,6 +254,12 @@ class FourAnchorDFlash(nn.Module):
         if metadata["target_signature"] != cls.signature(target.config):
             raise ValueError("Checkpoint and target architectures differ")
         model = cls(DraftConfig(**metadata["draft_config"]), target)
+        # Resume must not round saved FP32 master weights through the frozen
+        # target's BF16 dtype before the optimizer is restored.
+        if trainable_dtype is not None:
+            for parameter in model.parameters():
+                if parameter.requires_grad:
+                    parameter.data = parameter.data.to(trainable_dtype)
         state = load_file(str(path / "model.safetensors"))
         expected = {k for k in model.state_dict() if not k.startswith(("embed_tokens.", "lm_head."))}
         if set(state) != expected:

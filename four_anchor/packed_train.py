@@ -1,0 +1,232 @@
+"""Packed two-pass trainer, with exact step plans, per-epoch bars, and resume."""
+from contextlib import nullcontext
+from dataclasses import asdict
+from pathlib import Path
+import json
+import math
+import os
+import random
+import time
+
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+
+from .model import DraftConfig, FourAnchorDFlash
+from .packed_data import TeacherRecords, collate_documents, epoch_batches, prepare_records, schedule
+from .packed_objective import PackedTask
+from .provenance import record, checkpoint_hashes
+from .runtime import TargetRunner, load_target, resolve_device
+
+
+def metric_row(metrics):
+    values = metrics.tolist()
+    num, den = values[:2]
+    ce1, tv1, kl1, w1 = values[2:6]
+    ce2, tv2, kl2, w2 = values[6:10]
+    kept, predicted, blocks = values[10:13]
+    return {"loss": num / max(den, 1e-8),
+            "first_ce": ce1 / max(w1, 1e-8), "first_tv": tv1 / max(w1, 1e-8),
+            "first_kl": kl1 / max(w1, 1e-8),
+            "second_ce": ce2 / max(w2, 1e-8), "second_tv": tv2 / max(w2, 1e-8),
+            "second_kl": kl2 / max(w2, 1e-8),
+            "boundary_mean": kept / max(blocks, 1), "predicted_boundary_mean": predicted / max(blocks, 1),
+            "training_blocks": blocks}
+
+
+def train_packed(cfg):
+    from .train import TrainConfig, _rng_state, _restore_rng
+    world, rank, local_rank = (int(os.environ.get(k, d)) for k, d in
+                               [("WORLD_SIZE", "1"), ("RANK", "0"), ("LOCAL_RANK", "0")])
+    data, lengths, data_summary = prepare_records(cfg)
+    # Deterministic plans use the same packing algorithm on every rank. Cached
+    # rank-zero counts establish the actual scheduler length before model setup.
+    counts = schedule(cfg, data, lengths, world, verbose=rank == 0)
+    total_steps = sum(counts)
+    stop_step = min(cfg.max_steps or total_steps, total_steps)
+    device_name = cfg.device
+    if world > 1 and cfg.device.split(":")[0] in {"cuda", "npu"}:
+        device_name = f"{cfg.device.split(':')[0]}:{local_rank}"
+    device = resolve_device(device_name)
+    if world > 1:
+        dist.init_process_group(backend={"npu": "hccl", "cuda": "nccl"}.get(device.type, "gloo"))
+    torch.manual_seed(cfg.seed)
+    rng = random.Random(cfg.seed + rank)
+    if cfg.vllm_endpoint:
+        from .remote_teacher import FrozenTargetInterface
+        target = FrozenTargetInterface(cfg.target, device, getattr(torch, cfg.dtype), include_final=True)
+        target_norm = target.final_norm
+        runner = None
+    else:
+        if cfg.num_workers:
+            raise ValueError("Local target training requires num_workers=0; worker prefetch needs the remote teacher")
+        target, _ = load_target(cfg.target, str(device), cfg.dtype, cfg.target_revision, cfg.attention)
+        final = target.config.num_hidden_layers - 1
+        capture_ids = cfg.target_layer_ids + ([final] if final not in cfg.target_layer_ids else [])
+        runner = TargetRunner(target, capture_ids)
+        target_norm = target.model.norm
+    if cfg.max_sequence_length + 2 * cfg.num_proposals > target.config.max_position_embeddings:
+        raise ValueError("Target context window must allow two proposal blocks beyond the sequence length")
+    draft_cfg = DraftConfig(cfg.target, cfg.target_layer_ids, cfg.mask_token_id, cfg.num_draft_layers,
+                            cfg.num_anchors, cfg.num_proposals, cfg.attention, cfg.target_revision)
+    draft = FourAnchorDFlash.load(cfg.resume, target, trainable_dtype=torch.float32) if cfg.resume else FourAnchorDFlash(draft_cfg, target)
+    if asdict(draft.cfg) != asdict(draft_cfg):
+        raise ValueError("Resume model configuration differs")
+    if cfg.initialize_dflash:
+        draft.initialize_regular_dflash(cfg.initialize_dflash)
+    draft.gradient_checkpointing = cfg.gradient_checkpointing
+    for parameter in draft.parameters():
+        if parameter.requires_grad:
+            parameter.data = parameter.data.float()
+    task = PackedTask(draft, target_norm, cfg, rng).train()
+    wrapped = DistributedDataParallel(task, device_ids=[device.index] if device.type != "cpu" else None) if world > 1 else task
+    optimizer = torch.optim.AdamW([p for p in draft.parameters() if p.requires_grad],
+                                  lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    step, first_epoch, next_batch = 0, 0, 0
+    if cfg.resume:
+        state = torch.load(Path(cfg.resume) / "trainer.pt", map_location=device, weights_only=True)
+        previous = asdict(TrainConfig(**state["train_config"]))
+        operational = {"output", "resume", "initialize_dflash", "device", "checkpoint_every", "log_every",
+                       "max_steps", "tensorboard", "vllm_endpoint", "hidden_states_dir", "data_cache_dir",
+                       "progress", "num_workers"}
+        changes = [k for k, v in previous.items() if k not in operational and asdict(cfg)[k] != v]
+        if changes or previous["training_mode"] != "packed":
+            raise ValueError(f"Resume recipe differs: {changes}; use a fresh run for the packed objective")
+        if state["world_size"] != world or state["data_fingerprint"] != data._fingerprint:
+            raise ValueError("Exact resume requires the same dataset and world size")
+        if state["steps_per_epoch"] != counts:
+            raise ValueError("Resume packing schedule differs")
+        optimizer.load_state_dict(state["optimizer"])
+        step, first_epoch, next_batch = state["step"], state["next_epoch"], state["next_batch"]
+        _restore_rng(torch.load(Path(cfg.resume) / f"rng_rank_{rank}.pt", weights_only=True), rng, device)
+    output = Path(cfg.output)
+    settings = {**asdict(cfg), "world_size": world, "dataset_fingerprint": data._fingerprint,
+                "data_summary": data_summary, "steps_per_epoch": counts, "total_steps": total_steps,
+                "optimizer": "AdamW", "target_final_hidden": "pre-final-norm decoder output",
+                "training_boundary": "confidence/exploration capped at dataset prefix mismatch"}
+    if rank == 0:
+        output.mkdir(parents=True, exist_ok=True)
+        record(output, "train", settings)
+        (output / "train_config.json").write_text(json.dumps(asdict(cfg), indent=2) + "\n")
+        print(json.dumps({"event": "packed_training_start", **settings}), flush=True)
+    if world > 1:
+        dist.barrier()
+    writer = None
+    if rank == 0 and cfg.tensorboard:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(str(output / "logs/four_anchor_dflash"), purge_step=step if cfg.resume else None)
+    records = TeacherRecords(data, cfg, target.config, runner)
+    initial_step, started = step, time.monotonic()
+    saved = str(Path(cfg.resume)) if cfg.resume else None
+
+    def save(next_epoch, batch_offset):
+        nonlocal saved
+        path = output / f"checkpoint-{step:06d}"
+        if rank == 0:
+            draft.save(path)
+            torch.save({"optimizer": optimizer.state_dict(), "step": step, "next_epoch": next_epoch,
+                        "next_batch": batch_offset, "world_size": world, "data_fingerprint": data._fingerprint,
+                        "train_config": asdict(cfg), "steps_per_epoch": counts}, path / "trainer.pt")
+            record(path, "train", settings)
+            checkpoint_hashes(path)
+        if world > 1:
+            dist.barrier()
+        torch.save(_rng_state(rng, device), path / f"rng_rank_{rank}.pt")
+        if world > 1:
+            dist.barrier()
+        if rank == 0:
+            (output / "latest_checkpoint.txt").write_text(str(path.resolve()) + "\n")
+        saved = str(path)
+
+    try:
+        for epoch in range(first_epoch, cfg.epochs):
+            if step >= stop_step:
+                break
+            batches = epoch_batches(cfg, lengths, data._fingerprint, world, rank, epoch)
+            offset = next_batch if epoch == first_epoch else 0
+            if (len(batches) + cfg.gradient_accumulation - 1) // cfg.gradient_accumulation != counts[epoch]:
+                raise ValueError("Distributed packing plans disagree on epoch length")
+            remaining_updates = min(counts[epoch] - offset // cfg.gradient_accumulation, stop_step - step)
+            selected_batches = batches[offset:offset + remaining_updates * cfg.gradient_accumulation]
+            options = {}
+            if cfg.num_workers:
+                options.update(multiprocessing_context="spawn", prefetch_factor=2)
+            loader = DataLoader(records, batch_sampler=selected_batches, collate_fn=collate_documents,
+                                num_workers=cfg.num_workers, generator=torch.Generator().manual_seed(cfg.seed + epoch),
+                                **options)
+            iterator = iter(loader)
+            progress = tqdm(total=counts[epoch], initial=offset // cfg.gradient_accumulation,
+                            desc=f"Epoch {epoch + 1}/{cfg.epochs}", unit="step", dynamic_ncols=True,
+                            mininterval=1, disable=rank != 0 or not cfg.progress)
+            try:
+                while offset < len(batches) and step < stop_step:
+                    accumulation = min(cfg.gradient_accumulation, len(batches) - offset)
+                    optimizer.zero_grad(set_to_none=True)
+                    if step < cfg.warmup_steps:
+                        multiplier = (step + 1) / max(1, cfg.warmup_steps)
+                    else:
+                        multiplier = 0.5 * (1 + math.cos(math.pi * (step - cfg.warmup_steps) /
+                                                          max(1, total_steps - cfg.warmup_steps)))
+                    for group in optimizer.param_groups:
+                        group["lr"] = cfg.learning_rate * multiplier
+                    metrics = torch.zeros(13, device=device)
+                    for micro in range(accumulation):
+                        batch = {k: v.to(device=device) for k, v in next(iterator).items()}
+                        if batch["ids"].numel() > cfg.max_sequence_length:
+                            raise ValueError("Packed batch exceeds the per-rank token budget")
+                        sync = wrapped.no_sync() if world > 1 and micro + 1 < accumulation else nullcontext()
+                        with sync:
+                            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=cfg.dtype == "bfloat16"):
+                                numerator, denominator, values = wrapped(batch)
+                            if not torch.isfinite(numerator) or denominator <= 0:
+                                raise FloatingPointError("Nonfinite or unsupervised packed loss")
+                            numerator.backward()
+                        metrics += values
+                    if world > 1:
+                        dist.all_reduce(metrics)
+                    # DDP averaged the gradient sums by world size. Normalize by
+                    # the actual global supervised weight across this whole update.
+                    scale = world / metrics[1]
+                    for parameter in draft.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.mul_(scale)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(draft.parameters(), 1.0, error_if_nonfinite=True)
+                    optimizer.step()
+                    step += 1
+                    offset += accumulation
+                    elapsed = time.monotonic() - started
+                    row = {"step": step, "total_steps": total_steps, "epoch": epoch + 1,
+                           "step_in_epoch": math.ceil(offset / cfg.gradient_accumulation),
+                           "steps_in_epoch": counts[epoch], **metric_row(metrics),
+                           "learning_rate": optimizer.param_groups[0]["lr"], "grad_norm": float(grad_norm),
+                           "estimated_remaining_seconds": elapsed / (step - initial_step) * (total_steps - step)}
+                    if rank == 0 and step % cfg.log_every == 0:
+                        progress.write(json.dumps(row))
+                        with (output / "metrics.jsonl").open("a") as stream:
+                            stream.write(json.dumps(row) + "\n")
+                        if writer:
+                            for key, value in row.items():
+                                writer.add_scalar("train/" + key, value, step)
+                    epoch_end = offset == len(batches)
+                    periodic = epoch_end if cfg.checkpoint_each_epoch else step % cfg.checkpoint_every == 0
+                    if periodic or step == stop_step:
+                        save(epoch + int(epoch_end), 0 if epoch_end else offset)
+                    progress.set_postfix(loss=f"{row['loss']:.4f}", global_step=f"{step}/{total_steps}",
+                                         total_eta_h=f"{row['estimated_remaining_seconds'] / 3600:.2f}", refresh=False)
+                    progress.update(1)
+            finally:
+                progress.close()
+                # Release prefetch workers before opening the next epoch loader.
+                if cfg.num_workers:
+                    iterator._shutdown_workers()
+    finally:
+        records.close()
+        if runner:
+            runner.close()
+        if writer:
+            writer.close()
+        if world > 1:
+            dist.destroy_process_group()
+    return saved

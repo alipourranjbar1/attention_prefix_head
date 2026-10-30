@@ -18,7 +18,7 @@ from speculators.utils.loading import load_model_layers
 
 
 class FrozenTargetInterface(nn.Module):
-    def __init__(self, model_path, device, dtype):
+    def __init__(self, model_path, device, dtype, include_final=False):
         super().__init__()
         if not Path(model_path).is_dir():
             raise ValueError("Remote teacher training requires a local target checkpoint")
@@ -29,7 +29,10 @@ class FrozenTargetInterface(nn.Module):
             self.generation_config = GenerationConfig.from_pretrained(model_path, local_files_only=True)
         except OSError:
             self.generation_config = GenerationConfig.from_model_config(self.config)
-        weights = load_model_layers(["model.embed_tokens.weight", "lm_head.weight"], model_path)
+        keys = ["model.embed_tokens.weight", "lm_head.weight"]
+        if include_final:
+            keys.append("model.norm.weight")
+        weights = load_model_layers(keys, model_path)
         embedding = weights["model.embed_tokens.weight"].to(device=device, dtype=dtype)
         head = weights.get("lm_head.weight")
         if head is None and not self.config.tie_word_embeddings:
@@ -39,6 +42,11 @@ class FrozenTargetInterface(nn.Module):
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False, device="meta")
         head = embedding if head is None else head.to(device=device, dtype=dtype)
         self.lm_head.weight = nn.Parameter(head, requires_grad=False)
+        if include_final:
+            from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+            self.final_norm = Qwen3RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+            self.final_norm.weight = nn.Parameter(weights["model.norm.weight"].to(device=device, dtype=dtype),
+                                                  requires_grad=False)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -51,13 +59,15 @@ class FrozenTargetInterface(nn.Module):
 class RemoteState:
     ids: torch.Tensor
     features: torch.Tensor | None
+    final_hidden: torch.Tensor | None = None
 
 
 class RemoteTeacher:
     def __init__(self, target, layer_ids, endpoint, hidden_states_dir, model_name="four-anchor-teacher",
-                 timeout=180, max_retries=8, client=None):
+                 timeout=180, max_retries=8, client=None, include_final=False):
         self.target = target
         self.layer_ids = list(layer_ids)
+        self.include_final = include_final
         self.device = target.get_input_embeddings().weight.device
         self.dtype = target.get_input_embeddings().weight.dtype
         self.storage = Path(hidden_states_dir).resolve()
@@ -125,11 +135,16 @@ class RemoteTeacher:
             if data is None or data["token_ids"].tolist() != ids[0].tolist():
                 raise ValueError("Teacher hidden-state payload is absent or has different token IDs")
             features = data["hidden_states"]
-            expected = (ids.shape[1], len(self.layer_ids), self.target.config.hidden_size)
+            # The server's include-last-layer option appends the final decoder
+            # output only when it is not already in the requested capture list.
+            final_id = self.target.config.num_hidden_layers - 1
+            capture_ids = self.layer_ids + ([final_id] if self.include_final and final_id not in self.layer_ids else [])
+            expected = (ids.shape[1], len(capture_ids), self.target.config.hidden_size)
             if tuple(features.shape) != expected or not torch.isfinite(features).all():
                 raise ValueError(f"Expected finite hidden states shaped {expected}, got {tuple(features.shape)}")
-            features = features.flatten(1)[None].to(device=self.device, dtype=self.dtype)
-            return RemoteState(ids, features)
+            final = features[:, capture_ids.index(final_id)][None].to(device=self.device, dtype=self.dtype) if self.include_final else None
+            features = features[:, :len(self.layer_ids)].flatten(1)[None].to(device=self.device, dtype=self.dtype)
+            return RemoteState(ids, features, final)
         finally:
             self._delete(handle)
 

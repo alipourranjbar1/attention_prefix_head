@@ -17,7 +17,8 @@ def check(config):
     target = SimpleNamespace(config=target_config, get_input_embeddings=lambda: SimpleNamespace(weight=torch.empty(0)))
     client = RemoteTeacher(target, config["target_layer_ids"], config["vllm_endpoint"],
                            config["hidden_states_dir"], config["teacher_model_name"],
-                           config["request_timeout"], config["max_retries"])
+                           config["request_timeout"], config["max_retries"],
+                           include_final=config.get("training_mode") == "packed")
     try:
         client.check_server()
         data = load_records(config["data"], config["split"])
@@ -25,6 +26,13 @@ def check(config):
         if not ids:
             raise ValueError("First dataset row has no tokens")
         state = client.prefill(torch.tensor([ids], dtype=torch.long))
+        if config.get("training_mode") == "packed":
+            result = {"status": "passed", "hidden_states_shape": list(state.features.shape),
+                      "final_hidden_shape": list(state.final_hidden.shape), "target_calls": client.calls,
+                      "loss_fn": config["loss_fn"]}
+            print(json.dumps(result), flush=True)
+            Path(config["output"]).parent.joinpath("teacher_contract.json").write_text(json.dumps(result, indent=2) + "\n")
+            return
         try:
             generation = GenerationConfig.from_pretrained(config["target"], local_files_only=True)
         except OSError:

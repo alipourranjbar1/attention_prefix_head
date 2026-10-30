@@ -39,6 +39,12 @@ def build_config(env):
         initialize_dflash=env.get("DFLASH_INIT") or None, resume=env.get("RESUME") or None,
         data_cache_dir=env.get("DATA_CACHE_DIR") or None,
         progress=env.get("SHOW_PROGRESS", "1").lower() not in {"0", "false", "no"},
+        training_mode="packed", max_anchors=int(env.get("MAX_ANCHORS", "512")),
+        blocks_per_chunk=int(env.get("BLOCKS_PER_CHUNK", "32")),
+        head_chunk_size=int(env.get("HEAD_CHUNK_SIZE", "64")),
+        train_data_ratio=float(env.get("TRAIN_DATA_RATIO", "0.9")),
+        num_workers=int(env.get("NUM_WORKERS", "4")),
+        loss_fn=json.loads(env.get("LOSS_FN", '{"ce":0.1,"tv":0.9}')),
     )
     return config
 
@@ -50,10 +56,11 @@ if __name__ == "__main__":
     (out / "train_config.json").write_text(json.dumps(asdict(cfg), indent=2) + "\n")
     settings = {"target_npus": os.environ["TARGET_NPUS"], "train_npus": os.environ["TRAIN_NPUS"],
                 "conditioning_anchors": 4, "new_tokens_per_pass": cfg.num_proposals,
-                "query_positions": 4 + cfg.num_proposals, "training_blocks_per_sequence": 1,
-                "legacy_max_anchors": os.environ.get("MAX_ANCHORS", "512"),
-                "legacy_max_anchors_applied": False, "hf_decoder_layer_ids": cfg.target_layer_ids,
-                "vllm_capture_ids": [i + 1 for i in cfg.target_layer_ids], "last_layer_causal": False,
+                "query_positions": 4 + cfg.num_proposals, "max_blocks_per_packed_batch": cfg.max_anchors,
+                "training_mode": cfg.training_mode, "loss_fn": cfg.loss_fn,
+                "hf_decoder_layer_ids": cfg.target_layer_ids,
+                "vllm_capture_ids": [i + 1 for i in cfg.target_layer_ids], "include_final_target_layer": True,
+                "last_layer_causal": False,
                 "model": cfg.target, "dataset": cfg.data, "epochs": cfg.epochs,
                 "learning_rate": cfg.learning_rate, "sequence_length": cfg.max_sequence_length}
     (out / "launch_settings.json").write_text(json.dumps(settings, indent=2) + "\n")

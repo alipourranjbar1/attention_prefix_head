@@ -117,3 +117,30 @@ def test_remote_never_deletes_an_external_path(components, tmp_path):
             client._handle({"kv_transfer_params": {"hidden_states_path": str(tmp_path.parent / "unrelated.safetensors")}})
     finally:
         client.close()
+
+
+def test_packed_teacher_splits_final_prenorm_state_in_one_request(components, tmp_path):
+    target, _, runner = components
+    client, requests = make_client(tmp_path, target, runner)
+    client.layer_ids = [0]
+    client.include_final = True
+    try:
+        ids = torch.tensor([[1, 2, 3, 4]])
+        state = client.prefill(ids)
+        assert state.features.shape == (1, 4, 32)
+        assert state.final_hidden.shape == (1, 4, 32)
+        reconstructed = target.lm_head(target.model.norm(state.final_hidden))
+        torch.testing.assert_close(reconstructed, target(input_ids=ids).logits, atol=0, rtol=0)
+        assert len(requests) == 1
+        assert not list(tmp_path.glob("*.safetensors"))
+    finally:
+        client.close()
+
+
+def test_frozen_interface_loads_target_norm_for_dspark_loss(components, tmp_path):
+    target, _, _ = components
+    target.save_pretrained(tmp_path)
+    interface = FrozenTargetInterface(str(tmp_path), torch.device("cpu"), torch.float32, include_final=True)
+    assert set(dict(interface.named_parameters())) == {"embed_tokens.weight", "lm_head.weight", "final_norm.weight"}
+    torch.testing.assert_close(interface.final_norm.weight, target.model.norm.weight)
+    assert all(not p.requires_grad for p in interface.parameters())

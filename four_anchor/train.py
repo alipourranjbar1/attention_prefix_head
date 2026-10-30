@@ -66,6 +66,13 @@ class TrainConfig:
     max_retries: int = 8
     data_cache_dir: str | None = None
     progress: bool = True
+    training_mode: str = "online"
+    max_anchors: int = 512
+    blocks_per_chunk: int = 32
+    head_chunk_size: int = 64
+    train_data_ratio: float = 0.9
+    num_workers: int = 4
+    loss_fn: dict | None = None
 
     def __post_init__(self):
         if self.steps < 1 or self.gradient_accumulation < 1 or self.max_sequence_length < 2:
@@ -86,6 +93,21 @@ class TrainConfig:
             raise ValueError("max_steps must be positive")
         if self.vllm_endpoint and not self.hidden_states_dir:
             raise ValueError("Remote teacher requires hidden_states_dir")
+        if self.training_mode not in {"online", "packed"}:
+            raise ValueError("training_mode must be online or packed")
+        if min(self.max_anchors, self.blocks_per_chunk, self.head_chunk_size) < 1 or self.num_workers < 0:
+            raise ValueError("Invalid packed batching settings")
+        if not 0 < self.train_data_ratio <= 1:
+            raise ValueError("train_data_ratio must be in (0, 1]")
+        if self.training_mode == "packed" and self.epochs is None:
+            raise ValueError("Packed training requires epochs")
+        if self.loss_fn is not None:
+            if (not self.loss_fn or set(self.loss_fn) - {"ce", "tv", "kl_div"}
+                    or any(not math.isfinite(v) or v < 0 for v in self.loss_fn.values())
+                    or sum(self.loss_fn.values()) <= 0):
+                raise ValueError("loss_fn must contain nonnegative ce/tv/kl_div weights")
+            if self.training_mode != "packed":
+                raise ValueError("Distribution losses require packed training")
 
 
 class TrainingTask(nn.Module):
@@ -138,6 +160,9 @@ def _restore_rng(state, rng, device):
 
 
 def train(cfg: TrainConfig):
+    if cfg.training_mode == "packed":
+        from .packed_train import train_packed
+        return train_packed(cfg)
     world = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -167,7 +192,7 @@ def train(cfg: TrainConfig):
     draft_cfg = DraftConfig(cfg.target, cfg.target_layer_ids, cfg.mask_token_id, cfg.num_draft_layers,
                             cfg.num_anchors, cfg.num_proposals, cfg.attention, cfg.target_revision)
     if cfg.resume:
-        draft = FourAnchorDFlash.load(cfg.resume, target)
+        draft = FourAnchorDFlash.load(cfg.resume, target, trainable_dtype=torch.float32)
         if asdict(draft.cfg) != asdict(draft_cfg):
             raise ValueError("Resume model configuration differs from checkpoint")
     else:
