@@ -102,9 +102,48 @@ class AscendDflashProposer(AscendEagleProposer):
         if resolver is None:
             return False
         flags = resolver()
-        if not flags or any(flag != flags[0] for flag in flags):
-            raise ValueError("Ascend v1 DFlash needs uniform attention causality across draft layers")
+        if not flags:
+            raise ValueError("DFlash attention causality list must not be empty")
+        if any(flag != flags[0] for flag in flags):
+            if flags != [False] * (len(flags) - 1) + [True]:
+                raise ValueError("Mixed Ascend DFlash supports only a causal final layer")
+            if not self.speculative_config.enforce_eager:
+                raise ValueError("DFlash with a causal final layer requires draft enforce_eager=true")
+            parallel = self.vllm_config.parallel_config
+            if parallel.prefill_context_parallel_size != 1 or parallel.decode_context_parallel_size != 1:
+                raise ValueError("DFlash with a causal final layer requires context parallel sizes of 1")
+            # Build shared non-causal metadata; split the final layer below.
+            return False
         return bool(flags[0])
+
+    def load_model(self, model):
+        super().load_model(model)
+        self._dflash_attention_is_causal()
+
+    def build_draft_attn_metadata(self, common_attn_metadata, num_input_tokens, num_actual_tokens):
+        multi_steps, representative = super().build_draft_attn_metadata(
+            common_attn_metadata, num_input_tokens, num_actual_tokens
+        )
+        resolver = getattr(self.model, "get_draft_attn_causal", None)
+        flags = resolver() if resolver is not None else []
+        if not flags or all(flag == flags[0] for flag in flags):
+            return multi_steps, representative
+        self._dflash_attention_is_causal()
+        # Use each Attention's registered name; lexical order is not layer order.
+        layer_flags = dict(zip(self.model.get_draft_kv_cache_layer_names(), flags, strict=True))
+        per_layer = multi_steps[0]
+        if set(layer_flags) != set(per_layer):
+            raise ValueError("DFlash layer names do not match the draft attention metadata")
+        for group in self.draft_attn_groups:
+            builder = group.get_metadata_builder()
+            for name in group.layer_names:
+                if not layer_flags[name]:
+                    continue
+                metadata = self.shallow_copy_metadata(per_layer[name])
+                metadata.causal = True
+                metadata.attn_mask = builder.attn_mask_builder.get_attention_mask(True, builder.model_config)
+                per_layer[name] = metadata
+        return multi_steps, per_layer[self.draft_attn_groups[0].layer_names[0]]
 
     def set_inputs_first_pass(
         self,

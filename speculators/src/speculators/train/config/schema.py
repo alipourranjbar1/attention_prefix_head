@@ -184,13 +184,18 @@ class DraftArgs(_Group):
     sliding_window_non_causal: bool | None = Field(
         default=None,
         description="Use non-causal (bidirectional) masking within draft blocks for "
-        "sliding window attention layers. Full attention layers are always "
-        "bidirectional. Defaults to True for DFlash2 and False otherwise.",
+        "sliding window attention layers. Full attention layers are "
+        "bidirectional unless last_layer_causal overrides the final layer. Defaults to True for DFlash2 and False otherwise.",
     )
     draft_attn_impl: Literal["simple_flex_attention", "sdpa", "eager"] = Field(
         default="simple_flex_attention",
         description="Attention implementation for draft layers. Use 'sdpa' or 'eager' "
         "for hardware that doesn't support flex attention. Not supported for MTP.",
+    )
+    last_layer_causal: bool = Field(
+        default=False,
+        description="Plain DFlash: causal within-block attention in the final layer. "
+        "Use full-attention-indices for all layers to retain full target context.",
     )
 
 

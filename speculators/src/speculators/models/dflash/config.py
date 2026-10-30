@@ -66,8 +66,8 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
     sliding_window_non_causal: bool = Field(
         default=False,
         description="Use non-causal (bidirectional) masking within draft blocks for "
-        "sliding window attention layers. Full attention layers are always "
-        "bidirectional.",
+        "sliding window attention layers. Full attention layers are "
+        "bidirectional unless last_layer_causal overrides the final layer.",
     )
 
     sample_from_anchor: bool = Field(
@@ -79,6 +79,12 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
             "True: sample from anchor and all mask positions "
             "(block_size speculative tokens). "
         ),
+    )
+
+    last_layer_causal: bool = Field(
+        default=False,
+        description="Use causal within-block attention in the final DFlash layer. "
+        "Target context remains visible. Requires a full-context final layer.",
     )
 
     @field_serializer("transformer_layer_config")

@@ -57,10 +57,13 @@ _SLIDING_ATTENTION = "sliding_attention"
 
 def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
     """Resolve explicit causality before falling back to legacy layer defaults."""
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    if dflash_config.get("last_layer_causal", False):
+        return layer_idx == config.num_hidden_layers - 1
     is_causal = getattr(config, "is_causal", None)
     if is_causal is not None:
         return bool(is_causal)
-    override = (getattr(config, "dflash_config", None) or {}).get("causal")
+    override = dflash_config.get("causal")
     if override is not None:
         return bool(override)
     layer_types = getattr(config, "layer_types", None)

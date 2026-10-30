@@ -11,6 +11,7 @@ def create_anchor_block_mask_mod(
     block_size: int,
     sliding_window: int | None = None,
     sliding_window_non_causal: bool = False,
+    causal_block: bool = False,
 ):
     """
     Build a flex-attention mask mod where each query block corresponds to one anchor.
@@ -35,12 +36,15 @@ def create_anchor_block_mask_mod(
         block_size: number of query tokens per anchor block
         sliding_window: integer size of sliding window or None for full attn
         sliding_window_non_causal: Use non causal mask for sliding window attn
+        causal_block: Force causal attention inside each draft block, including
+            full-context layers. Does not change visibility of target context.
 
     Returns:
         mask_mod, q_len, kv_len
     """
-    # Always use non_causal for full attn
-    non_causal = sliding_window is None or sliding_window_non_causal
+    non_causal = not causal_block and (
+        sliding_window is None or sliding_window_non_causal
+    )
 
     device = document_ids.device
     anchor_positions = anchor_positions.to(device=device, dtype=torch.long).contiguous()

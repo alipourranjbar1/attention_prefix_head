@@ -468,6 +468,17 @@ def build_draft_model(
     extracts the native MTP head weights from the verifier, so the decoder-shaping
     flags and ``--draft-config`` do not apply.
     """
+    if getattr(args, "last_layer_causal", False):
+        if args.speculator_type != "dflash":
+            raise ValueError("--last-layer-causal requires --speculator-type dflash")
+        if args.from_pretrained:
+            saved_config = model_class.config_class.from_pretrained(args.from_pretrained)
+            if not saved_config.last_layer_causal:
+                raise ValueError(
+                    "--from-pretrained preserves the saved attention architecture; "
+                    "this checkpoint does not have last_layer_causal=true. "
+                    "Train a fresh draft without --from-pretrained."
+                )
     if args.from_pretrained:
         if is_config_only_dir(args.from_pretrained):
             logger.info(

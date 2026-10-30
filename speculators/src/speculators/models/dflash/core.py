@@ -108,6 +108,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.uses_sliding_window_attn = bool(self.sliding_window_indices)
         self.uses_full_attn = bool(num_draft_layers - len(self.sliding_window_indices))
         self.sliding_window_non_causal = config.sliding_window_non_causal
+        self.last_layer_causal = config.last_layer_causal
+        if self.last_layer_causal:
+            if config.speculators_model_type != "dflash":
+                raise ValueError("last_layer_causal is supported only for plain DFlash")
+            if num_draft_layers < 1 or num_draft_layers - 1 in self.sliding_window_indices:
+                raise ValueError("last_layer_causal requires a full-context final layer")
 
         self.norm = Qwen3RMSNorm(
             config.transformer_layer_config.hidden_size,
@@ -262,6 +268,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "aux_hidden_state_layer_ids": target_layer_ids,
             "mask_token_id": kwargs.get("mask_token_id"),
             "sliding_window_non_causal": sliding_window_non_causal,
+            "last_layer_causal": kwargs.get("last_layer_causal", False),
             "sample_from_anchor": sample_from_anchor,
             "speculators_config": SpeculatorsConfig(
                 algorithm=algorithm,
@@ -322,6 +329,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         device: torch.device,
         sliding_window: int | None = None,
         sliding_window_non_causal: bool = False,
+        causal_block: bool = False,
     ):
         mask_mod, q_len, kv_len = create_anchor_block_mask_mod(
             document_ids=document_ids.squeeze(0).to(device),
@@ -330,6 +338,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             block_size=self.block_size,
             sliding_window=sliding_window,
             sliding_window_non_causal=sliding_window_non_causal,
+            causal_block=causal_block,
         )
         return self._create_mask_fn(
             mask_mod,
@@ -399,6 +408,15 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
             self._build_attention_mask(loss_mask, num_anchors, document_ids, device)
         )
+        causal_attn_mask = None
+        if self.last_layer_causal:
+            causal_attn_mask = self._create_attention_mask(
+                document_ids=document_ids,
+                total_seq_len=total_seq_len,
+                anchor_positions=anchor_positions,
+                device=device,
+                causal_block=True,
+            )
 
         mask_tokens_size = num_anchors * self.block_size
 
@@ -450,12 +468,17 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
         for layer_idx, layer in enumerate(self.layers):
+            attention_mask = (
+                sliding_window_attn_mask
+                if layer_idx in self.sliding_window_indices
+                else full_attn_mask
+            )
+            if self.last_layer_causal and layer_idx == len(self.layers) - 1:
+                attention_mask = causal_attn_mask
             noise_embedding = layer(
                 hidden_states=noise_embedding,
                 target_hidden=fc_output,
-                attention_mask=sliding_window_attn_mask
-                if layer_idx in self.sliding_window_indices
-                else full_attn_mask,
+                attention_mask=attention_mask,
                 position_ids=position_ids,
                 use_cache=False,
                 position_embeddings=position_embeddings,

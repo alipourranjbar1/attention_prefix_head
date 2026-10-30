@@ -16,6 +16,7 @@ from vllm.model_executor.models.qwen3_dflash import (
     _get_dflash_fc_input_size,
     dflash_has_any_non_causal,
 )
+from vllm.transformers_utils.configs.speculators.algos import update_dflash
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
@@ -81,6 +82,24 @@ def test_dflash_layer_causal_honors_top_level_override():
     )
     assert _dflash_layer_causal(config, 0) is False
     assert _dflash_layer_causal(config, 1) is False
+
+
+def test_saved_last_causal_checkpoint_preserves_mixed_masks():
+    """Do not silently serve a last-causal checkpoint as all bidirectional."""
+    transformed = {"num_hidden_layers": 5, "layer_types": ["full_attention"] * 5}
+    update_dflash(
+        {
+            "speculators_model_type": "dflash",
+            "aux_hidden_state_layer_ids": [1, 9, 17, 25, 33],
+            "mask_token_id": 151669,
+            "last_layer_causal": True,
+            "sliding_window_non_causal": False,
+        },
+        transformed,
+    )
+    config = SimpleNamespace(**transformed)
+    assert [_dflash_layer_causal(config, i) for i in range(5)] == [False] * 4 + [True]
+    assert dflash_has_any_non_causal(config)
 
 
 def _vllm_config(**draft_config):

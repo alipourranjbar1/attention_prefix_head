@@ -128,6 +128,15 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
     pre_trained_config["dflash_config"]["causal"] = not config_dict.get(
         "sliding_window_non_causal", True
     )
+    if config_dict.get("last_layer_causal", False):
+        if config_dict.get("speculators_model_type") != "dflash":
+            raise ValueError("last_layer_causal requires plain DFlash")
+        layer_types = pre_trained_config.get("layer_types")
+        num_layers = pre_trained_config["num_hidden_layers"]
+        use_swa = pre_trained_config.get("use_swa", False)
+        if layer_types != ["full_attention"] * num_layers or use_swa:
+            raise ValueError("last_layer_causal serving requires full-context layers")
+        pre_trained_config["dflash_config"]["last_layer_causal"] = True
 
 
 @register_speculator("retrace")
