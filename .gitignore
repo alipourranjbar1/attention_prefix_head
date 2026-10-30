@@ -9,6 +9,7 @@
 !/vllm-ascend/
 !/four_anchor/
 !/pyproject.toml
+!/README.md
 !/README_FOUR_ANCHOR.md
 
 __pycache__/
