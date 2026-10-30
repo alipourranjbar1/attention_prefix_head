@@ -38,9 +38,9 @@ def load_records(path, split="train"):
     return load_dataset("json", data_files=str(path), split="train")
 
 
-def training_example(data, rng, num_proposals, max_sequence_length, vocab_size, device):
+def training_example(data, rng, num_proposals, max_sequence_length, vocab_size, device, row_index=None):
     for _ in range(1000):
-        row = data[rng.randrange(len(data))]
+        row = data[rng.randrange(len(data)) if row_index is None else row_index]
         if "input_ids" not in row:
             raise ValueError("Training needs tokenized input_ids; run `dflash4a prepare` first")
         ids = list(row["input_ids"])[:max_sequence_length]
@@ -53,6 +53,8 @@ def training_example(data, rng, num_proposals, max_sequence_length, vocab_size, 
             raise ValueError("Dataset contains an out-of-vocabulary token")
         starts = [i for i in range(1, len(ids)) if mask[i] > 0]
         if not starts:
+            if row_index is not None:
+                raise ValueError(f"Dataset row {row_index} has no supervised token after a nonempty prefix")
             continue
         start = rng.choice(starts)
         labels = ids[start:start + num_proposals]

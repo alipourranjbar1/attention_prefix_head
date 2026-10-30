@@ -3,7 +3,7 @@
 Validated on CPU with Python 3.12, PyTorch 2.10.0+cpu, Transformers 5.0.0,
 and the repository's pinned regular DFlash decoder implementation.
 
-- **56 tests passed.** These cover the D-Loop confidence score, four-anchor
+- **64 tests passed.** These cover the D-Loop confidence score, four-anchor
   token/state/position selection, padding, 20 query positions / 16 outputs,
   training gradients, frozen target weights, upstream regular-DFlash warm starts,
   checkpoint validation, cache rollback at multiple rejection positions, full
@@ -21,9 +21,18 @@ and the repository's pinned regular DFlash decoder implementation.
 - The actual `scripts/pipeline.sh` entry point completed training, evaluation,
   and sample generation using prepared tiny-model data.
 - Python compilation, shell syntax, and patch whitespace checks passed.
+- The added remote-teacher tests compare returned features and continuations
+  with a real tiny Qwen3 model behind a mocked HTTP transport. They check token-ID
+  validation, file cleanup, frozen embedding/head-only loading, and backward.
+- Epoch training visits all five rows of a tiny dataset in each epoch, handles
+  a partial accumulation group, checkpoints at epoch boundaries, and resumes
+  from the middle of an epoch with bitwise-identical final weights. TensorBoard
+  event files contain the expected loss values and optimizer-step indices.
+- The Ascend configuration builder checks the requested NPU split, paths,
+  five epochs, sequence length 3072, learning rate 0.0006, and four-anchor layout.
 
 **Not validated:** full Qwen3-4B training, acceptance improvements, accelerator
-speedup, CUDA/NPU kernels, and multiworker distributed execution. A two-worker
+speedup, live vLLM teacher integration, CUDA/NPU kernels, and multiworker distributed execution. A two-worker
 CPU run was attempted, but Gloo initialization failed with `Operation not
 permitted` under the environment's network restrictions. That result is not a
 distributed-training pass.

@@ -4,9 +4,65 @@ Branch: **`four-anchor-dflash-pipeline`**. This root README is the branch landin
 
 This implements **one shared regular DFlash drafter**, four explicit anchors, and two draft passes. Each pass has **4 anchor slots + 16 masked generation slots = 20 query positions** and predicts **16 new tokens**. It includes data preparation, training and resume, greedy inference, evaluation, HTTP serving, CPU tests, and launch scripts.
 
-The decoder layers are imported directly from `speculators.models.dflash.model_definitions.Qwen3DFlashDecoderLayer` in the repository's pinned submodule. No prefix-attention variant or MTP layer is instantiated. All changes live in `four_anchor/`; existing submodule code and pins are unchanged.
+The decoder layers are imported directly from `speculators.models.dflash.model_definitions.Qwen3DFlashDecoderLayer` in the repository's pinned submodule. No prefix-attention variant or MTP layer is instantiated. Implementation code lives in `four_anchor/`; existing submodule code and pins are unchanged.
 
 Source base: `alipourranjbar1/attention_prefix_head`, branch `prefix-attention-qwen3-4b`, root commit `831471c2207fcf41493c73d126ca023ced6cc301`, speculators commit `89b5caa300f473c1e3127497e6f594ba024057d5`.
+
+## Train on your Ascend setup
+
+Activate the existing `attention_prefix_ali` environment, then run from this branch's checkout:
+
+```bash
+CHECK_ONLY=0 bash four_anchor/scripts/train_ascend.sh
+```
+
+This uses the paths found in the supplied repository's existing training scripts:
+
+```bash
+MODEL=/home/n84449292/m84379596/Huggingface/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
+DATASET=/home/n84449292/m84379596/Huggingface/open_perfectblend.qwen3-4b-rollout.qwen3.seq3072
+```
+
+Existing exported `MODEL` and `DATASET` values take precedence. The launcher validates both local paths on your server. It sources CANN/ATB in the ABI-aware order from your script and uses the existing environment; it does not install or downgrade packages. `VLLM_SOURCE_ROOT` defaults to your original `attention_prefix_head` checkout, which supplies the working vLLM/vLLM-Ascend code. Four-anchor trainer and regular DFlash source come from this branch.
+
+| Setting | Ascend launcher |
+|---|---|
+| Target NPUs | `0,1`, vLLM data parallel size 2 |
+| Trainer NPUs | `2,3,4,5,6,7`, six DDP ranks |
+| Target model on trainer cards | Frozen embeddings and LM head only; no full target transformer |
+| Draft | Five regular bidirectional DFlash layers |
+| Conditioning anchors | 4 |
+| New tokens per pass | 16; 20 query positions total |
+| Sequence length | 3072 |
+| Epochs | 5 complete shuffled dataset passes |
+| Learning rate / schedule | 0.0006 / cosine; 50 warmup optimizer steps by default |
+| Precision / seed | BF16 autocast with FP32 trainable/master weights / 42 |
+| Gradient accumulation | 1 sequence per rank per update by default; `GRADIENT_ACCUMULATION` overrides |
+| Checkpoints / logging | Every epoch plus final/early stop; TensorBoard and `train.log` |
+| Target server port | 8080 |
+
+The supplied script's **causal final layer is not enabled**: this experiment remains regular DFlash. Its `MAX_ANCHORS=512` is a cap on sampled *training blocks*, not four conditioning tokens. The current reference trainer samples **one block per sequence**; it records the legacy value in `launch_settings.json` and explicitly reports that it is not applied. This has substantially less supervision per sequence than the old packed 512-block recipe, so these runs are not compute- or token-matched baselines.
+
+The new epoch mode visits every dataset row once per epoch per distributed partition (with the standard DistributedSampler padding of at most `world_size-1` repeated rows). Each row samples one valid prediction start. The final accumulation group uses its actual size, and resume restores the same epoch position and RNG state. `MAX_STEPS=10` can stop a short trial without changing the five-epoch cosine schedule; remove it when resuming a full run.
+
+The trainer keeps target decoder output indices `[1,9,17,25,33]`, zero-based as documented below. The supplied vLLM source includes embedding slot 0, so the launcher requests capture slots `[2,10,18,26,34]` with `--no-include-last-layer`. This translation makes remote training and HF inference use the same actual layer outputs.
+
+Each training block makes two teacher requests: prefix features, then a greedy continuation from the actual retained first-pass proposal. The second request's states are discarded, and both request files are cleaned up. Token IDs are returned directly; the client never reconstructs them from text. Before six drafters are allocated, the launcher tests the live server's model ID, hidden-state shape, prompt alignment, and generated-token-ID response.
+
+```bash
+# Optional import/configuration checks only:
+CHECK_ONLY=1 bash four_anchor/scripts/train_ascend.sh
+
+# Optional short run, then resume using its checkpoint and the same recipe:
+MAX_STEPS=10 CHECK_ONLY=0 bash four_anchor/scripts/train_ascend.sh
+RESUME=/path/to/run/checkpoints/checkpoint-000010 CHECK_ONLY=0 \
+  bash four_anchor/scripts/train_ascend.sh
+
+# Optional regular full-vocabulary DFlash warm start:
+DFLASH_INIT=/path/to/regular-dflash CHECK_ONLY=0 bash four_anchor/scripts/train_ascend.sh
+```
+
+The run directory is `output/four_anchor_dflash_<timestamp>_<pid>/`. Logs are `train.log`, `target_server.log`, and `checkpoints/logs/four_anchor_dflash/`; the resolved configuration is `train_config.json`. The launcher owns and shuts down only its target-server process group. CPU tests exercise the remote-client contract against a tiny Qwen teacher; actual Ascend/vLLM and multi-NPU execution still need validation on your server.
 
 ## Exact algorithm
 
@@ -115,7 +171,7 @@ For each example, training runs the actual two-pass structure. The first block i
 
 This teacher rollout is intentionally expensive: up to 16 incremental target calls per training example, plus processing the retained prefix and initial prefill. It avoids silently supervising the redraft with a continuation conditioned on a different prefix. `boundary_exploration=0` uses only the inference boundary rule; the default `0.5` also samples from the paper-inspired geometric distribution with `beta=0.7`.
 
-One example is processed per device per microstep. Gradient accumulation controls effective batch size. Distributed training uses DDP and gradient synchronization only on the final accumulation microstep. Trainable parameters/optimizer states stay float32; the bfloat16 setting uses autocast. Target weights remain frozen. Training is step-based with random example/start sampling, not a claim to reproduce the paper's five-epoch schedule.
+One example is processed per device per microstep. Gradient accumulation controls effective batch size. Distributed training uses DDP and gradient synchronization only on the final accumulation microstep. Trainable parameters/optimizer states stay float32; the bfloat16 setting uses autocast. Target weights remain frozen. The generic JSON config is step-based with random example/start sampling. Setting `epochs` instead enables shuffled dataset passes; the Ascend launcher above uses this mode. Neither objective claims to reproduce the paper's complementary training recipe.
 
 Checkpoints include model/config, optimizer, per-rank RNG state, source versions/hashes, command settings, dataset fingerprint, diffs, and model SHA256. Resume uses the same dataset, world size, model configuration, and total learning-rate schedule. Keep those settings fixed for reproducibility.
 

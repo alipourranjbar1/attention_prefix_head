@@ -14,7 +14,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "httpx"]
+test = ["pytest>=8", "httpx", "tensorboard"]
+train = ["tensorboard"]
 
 [project.scripts]
 dflash4a = "four_anchor.cli:main"
