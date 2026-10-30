@@ -26,10 +26,11 @@ unset ASCEND_LAUNCH_BLOCKING DFLASH_TP_GATHER
 export no_proxy="localhost,127.0.0.1,::1" NO_PROXY="localhost,127.0.0.1,::1"
 export SOC_VERSION="${SOC_VERSION:-ascend910_9372}"
 export TARGET_NPUS="${TARGET_NPUS:-0,1}" TRAIN_NPUS="${TRAIN_NPUS:-2,3,4,5,6,7}"
-export PORT="${PORT:-8080}" SEQ_LENGTH="${SEQ_LENGTH:-3072}" BLOCK_SIZE="${BLOCK_SIZE:-16}"
+export PORT="${PORT:-8093}" SEQ_LENGTH="${SEQ_LENGTH:-6144}" BLOCK_SIZE="${BLOCK_SIZE:-16}"
 export EPOCHS="${EPOCHS:-5}" LR="${LR:-0.0006}" SEED="${SEED:-42}"
 export GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-1}" LOG_FREQ="${LOG_FREQ:-10}"
-export MAX_ANCHORS="${MAX_ANCHORS:-512}"  # sampled blocks per packed batch; four anchors inside each block
+export MAX_ANCHORS="${MAX_ANCHORS:-1024}"  # sampled blocks per packed batch; four anchors inside each block
+export DISTRIBUTED_STRATEGY="${DISTRIBUTED_STRATEGY:-fsdp}"
 export NUM_WORKERS="${NUM_WORKERS:-4}" TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.9}"
 export BLOCKS_PER_CHUNK="${BLOCKS_PER_CHUNK:-32}" HEAD_CHUNK_SIZE="${HEAD_CHUNK_SIZE:-64}"
 if [[ -z "${LOSS_FN:-}" ]]; then export LOSS_FN='{"ce":0.1,"tv":0.9}'; fi
@@ -55,6 +56,7 @@ PY
 python -m four_anchor.ascend_config
 printf 'Packed token budget: %s per rank; up to %s sampled training blocks; loss=%s\n' "$SEQ_LENGTH" "$MAX_ANCHORS" "$LOSS_FN"
 printf 'Training layout: 4 conditioning anchors + %s new slots; all five draft layers bidirectional.\n' "$BLOCK_SIZE"
+printf 'Distributed strategy: %s\n' "$DISTRIBUTED_STRATEGY"
 IFS=',' read -r -a train_devices <<< "$TRAIN_NPUS"
 # Count real packed updates before starting either the target server or trainers.
 python -m four_anchor.packed_data --config "$OUTPUT_DIR/train_config.json" --world-size "${#train_devices[@]}"
@@ -64,11 +66,27 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 export OUTPUT_DIR
 IFS=',' read -r -a target_devices <<< "$TARGET_NPUS"
 IFS=',' read -r -a train_devices <<< "$TRAIN_NPUS"
-python - "$PORT" <<'PY'
+python - "$PORT" "${MASTER_PORT:-29647}" <<'PY'
 import socket,sys
-with socket.socket() as sock:
-    sock.bind(('127.0.0.1',int(sys.argv[1])))
+ports = [int(x) for x in sys.argv[1:]]
+if len(set(ports)) != len(ports):
+    raise SystemExit('PORT and MASTER_PORT must differ')
+for port in ports:
+    with socket.socket() as sock:
+        try:
+            sock.bind(('127.0.0.1',port))
+        except OSError as exc:
+            raise SystemExit(f'Port {port} is busy: choose another PORT/MASTER_PORT. {exc}')
 PY
+# Exercise actual sharding and checkpoint collectives on the allocated trainers
+# before loading Qwen3-4B on the target server. Small synthetic model only.
+if [[ "$DISTRIBUTED_STRATEGY" == fsdp ]]; then
+    ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" python -m torch.distributed.run \
+        --nnodes=1 --nproc_per_node="${#train_devices[@]}" \
+        --master_addr=127.0.0.1 --master_port="${MASTER_PORT:-29647}" \
+        -m four_anchor.fsdp_check --device npu --dtype bfloat16 \
+        --output "$OUTPUT_DIR/fsdp_check" 2>&1 | tee "$OUTPUT_DIR/fsdp_check.log"
+fi
 server_pid=''
 cleanup() {
     if [[ -n "$server_pid" ]]; then kill -TERM -- "-$server_pid" 2>/dev/null || true; fi
@@ -101,7 +119,7 @@ python -m four_anchor.check_teacher --config "$OUTPUT_DIR/train_config.json" \
     2>&1 | tee "$OUTPUT_DIR/teacher_check.log"
 ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" python -m torch.distributed.run \
     --nnodes=1 --nproc_per_node="${#train_devices[@]}" \
-    --master_addr=127.0.0.1 --master_port="${MASTER_PORT:-29637}" \
+    --master_addr=127.0.0.1 --master_port="${MASTER_PORT:-29647}" \
     -m four_anchor.cli train --config "$OUTPUT_DIR/train_config.json" \
     2>&1 | tee "$OUTPUT_DIR/train.log"
 printf 'Training finished: %s\nTensorBoard logs: %s/checkpoints/logs/four_anchor_dflash\n' "$OUTPUT_DIR" "$OUTPUT_DIR"

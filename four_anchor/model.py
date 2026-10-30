@@ -194,13 +194,14 @@ class FourAnchorDFlash(nn.Module):
         hidden = self.norm(x[:, a:])
         return DraftOutput(self.lm_head(hidden), hidden)
 
-    def save(self, path):
+    def save(self, path, state_dict=None):
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         metadata = {"architecture": "FourAnchorDFlash", "draft_config": asdict(self.cfg),
                     "target_signature": self.target_signature}
         (path / "four_anchor_config.json").write_text(json.dumps(metadata, indent=2) + "\n")
-        state = {k: v.detach().cpu().contiguous() for k, v in self.state_dict().items()
+        source = self.state_dict() if state_dict is None else state_dict
+        state = {k: v.detach().cpu().contiguous() for k, v in source.items()
                  if not k.startswith(("embed_tokens.", "lm_head."))}
         save_file(state, str(path / "model.safetensors"))
 

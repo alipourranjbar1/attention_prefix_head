@@ -73,6 +73,7 @@ class TrainConfig:
     train_data_ratio: float = 0.9
     num_workers: int = 4
     loss_fn: dict | None = None
+    distributed_strategy: str = "ddp"
 
     def __post_init__(self):
         if self.steps < 1 or self.gradient_accumulation < 1 or self.max_sequence_length < 2:
@@ -95,6 +96,10 @@ class TrainConfig:
             raise ValueError("Remote teacher requires hidden_states_dir")
         if self.training_mode not in {"online", "packed"}:
             raise ValueError("training_mode must be online or packed")
+        if self.distributed_strategy not in {"ddp", "fsdp"}:
+            raise ValueError("distributed_strategy must be ddp or fsdp")
+        if self.distributed_strategy == "fsdp" and self.training_mode != "packed":
+            raise ValueError("FSDP is supported by the packed trainer")
         if min(self.max_anchors, self.blocks_per_chunk, self.head_chunk_size) < 1 or self.num_workers < 0:
             raise ValueError("Invalid packed batching settings")
         if not 0 < self.train_data_ratio <= 1:

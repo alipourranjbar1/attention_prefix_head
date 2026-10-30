@@ -28,14 +28,14 @@ Existing exported `MODEL` and `DATASET` values take precedence. The launcher val
 | Setting | Ascend launcher |
 |---|---|
 | Target NPUs | `0,1`, vLLM data parallel size 2 |
-| Trainer NPUs | `2,3,4,5,6,7`, six DDP ranks |
+| Trainer NPUs | `2,3,4,5,6,7`, six **FSDP FULL_SHARD** ranks |
 | Target model on trainer cards | Frozen embeddings, final norm and LM head; no full target transformer |
 | Draft | Five regular bidirectional DFlash layers |
 | Conditioning anchors | 4 |
 | New tokens per pass | 16; 20 query positions total |
-| Packed token budget | 3072 per trainer rank |
+| Packed token budget | **6144 per trainer rank**, up to 36,864 across six trainers |
 | Training / held-out split | 90% / 10%; `TRAIN_DATA_RATIO` overrides |
-| Training blocks | Up to 512 per packed batch (`MAX_ANCHORS`) |
+| Training blocks | Up to **1024 per trainer rank** (`MAX_ANCHORS`), 6144 across six trainers |
 | Loss on both passes | **0.1 CE + 0.9 TV**, full target vocabulary |
 | Optimizer | AdamW, unchanged; DSpark loss does not select Muon |
 | Epochs | 5 shuffled passes over the training split |
@@ -44,17 +44,25 @@ Existing exported `MODEL` and `DATASET` values take precedence. The launcher val
 | Gradient accumulation | 1 packed batch per rank per update; `GRADIENT_ACCUMULATION` overrides |
 | Checkpoints / logging | Every epoch plus final/early stop; TensorBoard and `train.log` |
 | Progress bar | Rank 0 shows steps, percentage, elapsed time, ETA, loss and epoch |
-| Target server port | 8080 |
+| Target server / trainer rendezvous ports | 8093 / 29647 (`PORT` / `MASTER_PORT`) |
 
-The model remains five bidirectional regular DFlash layers. **Four** is the number of conditioning tokens inside each block; **512** is the maximum number of sampled prediction starts in one packed batch. Each start creates 4 anchor slots plus 16 generation slots. Anchor slots have no loss.
+The model remains five bidirectional regular DFlash layers. **Four** is the number of conditioning tokens inside each block; **1024** is the maximum number of sampled prediction starts in one packed batch. Each start creates 4 anchor slots plus 16 generation slots. Anchor slots have no loss.
 
-Training now uses the repository's `MultipackDistributedBatchSamplerV2`: it packs whole documents up to 3072 tokens per rank, resets their positions and blocks cross-document attention. Like that sampler, it can drop fewer than `world_size` trailing rows to keep ranks synchronized. Rows are shuffled each epoch. The 90% training split is deterministic; held-out rows are excluded from optimization. Set `TRAIN_DATA_RATIO=1` only if the comparison baseline also trains on the full dataset.
+Training now uses the repository's `MultipackDistributedBatchSamplerV2`: it packs whole documents up to **6144 tokens per rank**, resets their positions and blocks cross-document attention. Like that sampler, it can drop fewer than `world_size` trailing rows to keep ranks synchronized. Rows are shuffled each epoch. The 90% training split is deterministic; held-out rows are excluded from optimization. Set `TRAIN_DATA_RATIO=1` only if the comparison baseline also trains on the full dataset.
+
+The dataset directory ending in `seq3072` is still used: the packer combines independent documents into the larger per-rank budget. It does not create 6144-token single-document continuations. The previous 3072 setting was also **per rank**, not shared across all six trainers. Step counts are recalculated for the new packing budget.
+
+`DISTRIBUTED_STRATEGY=fsdp` now selects actual PyTorch FSDP `FULL_SHARD`, with FP32 master parameters/optimizer states sharded across trainer NPUs, BF16 compute and FP32 gradient reduction. The frozen target embedding, LM head and final norm remain replicated. A single FSDP wrapper encloses the entire `PackedTask`: ranks may execute different numbers of block chunks or redrafts, so decoder-layer auto-wrapping would risk mismatched collectives. The complete draft's compute weights are temporarily gathered during a step; FSDP does not shard activations or the per-rank token batch. Gradient clipping uses FSDP's global norm.
+
+Before loading the target server, the launcher runs a small **real six-rank HCCL/FSDP check** on the trainer devices. It checks parameter sharding, unequal chunk counts, backward, full model/optimizer checkpoint export, and a matching resumed continuation. A failure stops the launch; inspect `fsdp_check.log`. `CHECK_ONLY=1` remains CPU imports/configuration/packing only. Full checkpoints stay compatible with the inference/evaluation/serving commands. Fresh FSDP training is required when changing strategy or the packing recipe; exact optimizer resume requires the same strategy, world size, data and schedule.
+
+For the previous DDP recipe, explicitly set `DISTRIBUTED_STRATEGY=ddp SEQ_LENGTH=3072 MAX_ANCHORS=512`. The generic single-process JSON recipe continues to use DDP/local-target training; the Ascend launcher builds the new FSDP configuration from its environment.
 
 The launcher computes **actual steps for each epoch and all epochs** before starting the target server, and writes `checkpoints/packing_plan.json`. It does not hard-code 80,000 or shorten the dataset to force a count. The previous 1,183,640 bar counted all five epochs of an unpacked, one-row trainer. A packed count depends on token lengths, train split, worker count and accumulation. A 70–80k *per-epoch* count would mean 350–400k updates over five epochs. The 10–12 hour runtime must be measured on the NPUs.
 
 The bar now reads `Epoch 1/5: ... current/steps_this_epoch`, with elapsed time and epoch ETA. Its postfix shows the global step and an estimated remaining time for the full run. JSON metrics and TensorBoard separately log first/second CE and TV (KL is diagnostic and has zero weight in the default loss). `SHOW_PROGRESS=0` hides only the bar. `MAX_STEPS` stops a trial without changing the five-epoch schedule.
 
-Before packing, an Arrow scan filters rows without a supervised token after a nonempty prefix within 3072 tokens. This fixes the observed unsupervised-row crash without skipping individual DDP updates. Row indices, lengths and packing plans are cached under `output/.four_anchor_data_cache`; source data remains unchanged. Start a **fresh run** when switching from the old online objective; old optimizer checkpoints are not compatible with the new schedule/objective. Corrected packed runs support exact resume with per-rank RNG and FP32 master weights preserved.
+Before packing, an Arrow scan filters rows without a supervised token after a nonempty prefix within the configured sequence budget. This fixes the observed unsupervised-row crash without skipping individual DDP updates. Row indices, lengths and packing plans are cached under `output/.four_anchor_data_cache`; source data remains unchanged. Start a **fresh run** when switching from the old online objective; old optimizer checkpoints are not compatible with the new schedule/objective. Corrected packed runs support exact resume with per-rank RNG and FP32 master weights preserved.
 
 The launcher requests vLLM capture slots `[2,10,18,26,34]` plus the final decoder output using `--include-last-layer`. The five drafter taps remain zero-based decoder indices `[1,9,17,25,33]`; vLLM numbers embedding as zero. The extra final state supplies the loss targets only: the frozen target final norm and LM head reconstruct its next-token distribution. The hidden state at token `t-1` supervises prediction of token `t`.
 
@@ -73,7 +81,9 @@ RESUME=/path/to/run/checkpoints/checkpoint-000010 CHECK_ONLY=0 \
 DFLASH_INIT=/path/to/regular-dflash CHECK_ONLY=0 bash four_anchor/scripts/train_ascend.sh
 ```
 
-The run directory is `output/four_anchor_dflash_<timestamp>_<pid>/`. Logs are `train.log`, `target_server.log`, and `checkpoints/logs/four_anchor_dflash/`; the resolved configuration is `train_config.json`. The launcher owns and shuts down only its target-server process group. The packed implementation is tested on CPU, including BF16 resume and exact greedy decoding after training. Full six-rank Ascend training and wall-clock throughput remain to be validated on the server.
+The run directory is `output/four_anchor_dflash_<timestamp>_<pid>/`. Logs are `train.log`, `target_server.log`, and `checkpoints/logs/four_anchor_dflash/`; the resolved configuration is `train_config.json`. The launcher owns and shuts down only its target-server process group. The packed implementation is tested on CPU, including BF16 resume and exact greedy decoding after training. FSDP state/optimizer conversion and continuation are tested with real FSDP module APIs in single-rank NO_SHARD mode using in-process fake collectives. Actual multi-rank FULL_SHARD/HCCL and throughput must pass the included server-side check; they could not be executed here because Gloo sockets are blocked.
+
+The training JSON log includes rank-zero `memory_allocated_gib`, `memory_reserved_gib` and `peak_memory_allocated_gib` (each prefixed `rank0_`). Process memory reported by `npu-smi` can also include runtime/cache overhead. The block and head chunk sizes plus checkpointing reduce memory compared with a fully materialized loss; 10–15 GB alone does not show that supervision is missing. At the new limits and accumulation 1, global `training_blocks` can reach 6144 (1024 per rank), provided each batch has enough eligible positions.
 
 ## Exact algorithm
 
@@ -184,7 +194,7 @@ Both views minimize the requested **DSpark loss**, `0.1 * CE + 0.9 * TV`. CE use
 
 Only the original verified prefix supplies target feature memory in both views. Retained proposal anchors use detached first-pass draft states, never teacher states of the retained proposals. If a group's retained lengths are all zero, the two views have exactly the same inputs and targets; the trainer reuses the first computation with both loss weights instead of repeating it. Nonzero retained prefixes run the second drafter pass.
 
-DDP normalizes gradients by actual global supervised weight across all ranks and accumulation microbatches. Trainable weights and optimizer states remain FP32; BF16 uses autocast. Local-target training uses `num_workers=0`; the Ascend remote-teacher launcher uses four CPU workers per trainer rank. The previous `training_mode="online"` implementation remains available for controlled legacy experiments, but neither supplied default selects it.
+DDP/FSDP normalize gradients by actual global supervised weight across all ranks and accumulation microbatches. Trainable weights and optimizer states remain FP32; BF16 uses autocast. Local-target training uses `num_workers=0`; the Ascend remote-teacher launcher uses four CPU workers per trainer rank. The previous `training_mode="online"` implementation remains available for controlled legacy experiments, but neither supplied default selects it.
 
 Checkpoints include model/config, optimizer, per-rank RNG state, source versions/hashes, command settings, dataset fingerprint, diffs, and model SHA256. Resume uses the same dataset, world size, model configuration, and total learning-rate schedule. Keep those settings fixed for reproducibility.
 

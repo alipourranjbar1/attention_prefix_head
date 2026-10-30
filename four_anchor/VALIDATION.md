@@ -1,7 +1,7 @@
 # Validation of packed training and DSpark loss
 
 Validated on CPU with Python 3.12, PyTorch 2.10.0+cpu, Transformers 5.0.0,
-and the pinned regular DFlash decoder implementation. **87 tests passed.**
+and the pinned regular DFlash decoder implementation. **91 tests passed.**
 
 The new packed tests verify:
 
@@ -42,3 +42,23 @@ training retained prefix at a dataset-token mismatch. This is explicitly
 documented in README.md; inference remains confidence-based. Old online
 optimizer checkpoints cannot resume the packed schedule. No trained Qwen3-4B
 weights are included.
+
+## FSDP update
+
+The Ascend defaults are now FULL_SHARD, 6144 packed tokens and up to 1024 training
+blocks **per training NPU**. Four conditioning anchors and sixteen proposals per
+pass are unchanged. Frozen teacher modules remain replicated.
+
+Additional CPU checks exercise actual FSDP module hooks, full state dictionary
+export, optimizer-state conversion, FP32/BF16 resumed continuation, and rejection
+of invalid single-rank production launches. These use single-rank NO_SHARD with
+an in-process fake collective backend; they do not validate multi-rank sharding.
+A Gloo attempt on this host failed with `Operation not permitted` during socket
+creation. No real distributed execution pass is claimed.
+
+`four_anchor.fsdp_check` is automatically run with the real training world and
+HCCL before loading Qwen3-4B on the server. It intentionally gives ranks different
+numbers of chunks and checks FULL_SHARD storage, finite gradients, collective
+checkpointing, and equivalent continuation after restore. Its result and logs
+are saved under the run directory. Actual NPU compatibility and throughput
+remain hardware checks, not results established by the CPU suite.

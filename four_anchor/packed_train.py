@@ -10,7 +10,6 @@ import time
 
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -19,6 +18,7 @@ from .packed_data import TeacherRecords, collate_documents, epoch_batches, prepa
 from .packed_objective import PackedTask
 from .provenance import record, checkpoint_hashes
 from .runtime import TargetRunner, load_target, resolve_device
+from .distributed import wrap_task, checkpoint_states, restore_optimizer, clip_grad_norm
 
 
 def metric_row(metrics):
@@ -36,10 +36,22 @@ def metric_row(metrics):
             "training_blocks": blocks}
 
 
+def memory_metrics(device):
+    if device.type not in {"cuda", "npu"}:
+        return {}
+    backend = getattr(torch, device.type)
+    return {"rank0_" + label + "_gib": getattr(backend, fn)(device) / 2**30
+            for label, fn in (("memory_allocated", "memory_allocated"),
+                              ("memory_reserved", "memory_reserved"),
+                              ("peak_memory_allocated", "max_memory_allocated"))}
+
+
 def train_packed(cfg):
     from .train import TrainConfig, _rng_state, _restore_rng
     world, rank, local_rank = (int(os.environ.get(k, d)) for k, d in
                                [("WORLD_SIZE", "1"), ("RANK", "0"), ("LOCAL_RANK", "0")])
+    if cfg.distributed_strategy == "fsdp" and world < 2:
+        raise ValueError("FSDP requires torchrun with at least two training ranks")
     data, lengths, data_summary = prepare_records(cfg)
     # Deterministic plans use the same packing algorithm on every rank. Cached
     # rank-zero counts establish the actual scheduler length before model setup.
@@ -81,12 +93,18 @@ def train_packed(cfg):
         if parameter.requires_grad:
             parameter.data = parameter.data.float()
     task = PackedTask(draft, target_norm, cfg, rng).train()
-    wrapped = DistributedDataParallel(task, device_ids=[device.index] if device.type != "cpu" else None) if world > 1 else task
+    wrapped = wrap_task(task, cfg.distributed_strategy, device, cfg.dtype, world)
     optimizer = torch.optim.AdamW([p for p in draft.parameters() if p.requires_grad],
                                   lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
     step, first_epoch, next_batch = 0, 0, 0
     if cfg.resume:
-        state = torch.load(Path(cfg.resume) / "trainer.pt", map_location=device, weights_only=True)
+        # Avoid loading six copies of the full optimizer onto NPU memory.
+        state = torch.load(Path(cfg.resume) / "trainer.pt", map_location="cpu", weights_only=True) if rank == 0 else None
+        full_optimizer = state.pop("optimizer") if rank == 0 else {}
+        metadata = [state]
+        if world > 1:
+            dist.broadcast_object_list(metadata, src=0, device=device)
+        state = metadata[0]
         previous = asdict(TrainConfig(**state["train_config"]))
         operational = {"output", "resume", "initialize_dflash", "device", "checkpoint_every", "log_every",
                        "max_steps", "tensorboard", "vllm_endpoint", "hidden_states_dir", "data_cache_dir",
@@ -98,7 +116,10 @@ def train_packed(cfg):
             raise ValueError("Exact resume requires the same dataset and world size")
         if state["steps_per_epoch"] != counts:
             raise ValueError("Resume packing schedule differs")
-        optimizer.load_state_dict(state["optimizer"])
+        if cfg.distributed_strategy == "ddp" and rank != 0:
+            full_optimizer = torch.load(Path(cfg.resume) / "trainer.pt", map_location="cpu", weights_only=True)["optimizer"]
+        restore_optimizer(wrapped, optimizer, full_optimizer)
+        del full_optimizer
         step, first_epoch, next_batch = state["step"], state["next_epoch"], state["next_batch"]
         _restore_rng(torch.load(Path(cfg.resume) / f"rng_rank_{rank}.pt", weights_only=True), rng, device)
     output = Path(cfg.output)
@@ -124,9 +145,12 @@ def train_packed(cfg):
     def save(next_epoch, batch_offset):
         nonlocal saved
         path = output / f"checkpoint-{step:06d}"
+        # FSDP gathers are collective: every rank must participate before only
+        # rank zero writes the portable model and full optimizer checkpoint.
+        model_state, optimizer_state = checkpoint_states(wrapped, draft, optimizer)
         if rank == 0:
-            draft.save(path)
-            torch.save({"optimizer": optimizer.state_dict(), "step": step, "next_epoch": next_epoch,
+            draft.save(path, state_dict=model_state)
+            torch.save({"optimizer": optimizer_state, "step": step, "next_epoch": next_epoch,
                         "next_batch": batch_offset, "world_size": world, "data_fingerprint": data._fingerprint,
                         "train_config": asdict(cfg), "steps_per_epoch": counts}, path / "trainer.pt")
             record(path, "train", settings)
@@ -186,13 +210,13 @@ def train_packed(cfg):
                         metrics += values
                     if world > 1:
                         dist.all_reduce(metrics)
-                    # DDP averaged the gradient sums by world size. Normalize by
+                    # DDP/FSDP averaged gradient sums by world size. Normalize by
                     # the actual global supervised weight across this whole update.
                     scale = world / metrics[1]
                     for parameter in draft.parameters():
                         if parameter.grad is not None:
                             parameter.grad.mul_(scale)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(draft.parameters(), 1.0, error_if_nonfinite=True)
+                    grad_norm = clip_grad_norm(wrapped, draft, 1.0)
                     optimizer.step()
                     step += 1
                     offset += accumulation
@@ -203,6 +227,7 @@ def train_packed(cfg):
                            "learning_rate": optimizer.param_groups[0]["lr"], "grad_norm": float(grad_norm),
                            "estimated_remaining_seconds": elapsed / (step - initial_step) * (total_steps - step)}
                     if rank == 0 and step % cfg.log_every == 0:
+                        row.update(memory_metrics(device))
                         progress.write(json.dumps(row))
                         with (output / "metrics.jsonl").open("a") as stream:
                             stream.write(json.dumps(row) + "\n")
