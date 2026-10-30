@@ -17,7 +17,7 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 import torch.distributed as dist
 
-from .data import load_records, training_example
+from .data import filter_training_records, load_records, training_example
 from .model import DraftConfig, FourAnchorDFlash, make_anchors, select_boundary
 from .runtime import TargetRunner, load_target, resolve_device
 from .provenance import record, checkpoint_hashes
@@ -63,6 +63,7 @@ class TrainConfig:
     teacher_model_name: str = "four-anchor-teacher"
     request_timeout: int = 180
     max_retries: int = 8
+    data_cache_dir: str | None = None
 
     def __post_init__(self):
         if self.steps < 1 or self.gradient_accumulation < 1 or self.max_sequence_length < 2:
@@ -138,6 +139,14 @@ def train(cfg: TrainConfig):
     world = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    # Filter once via a shared index cache before model allocation or process-
+    # group initialization. Skipping individual rank steps would desynchronize
+    # DDP; all ranks must instead partition the same trainable dataset.
+    data = load_records(cfg.data, cfg.split)
+    data, data_filter = filter_training_records(
+        data, cfg.max_sequence_length, cfg.data_cache_dir or Path(cfg.output) / ".data_cache")
+    if rank == 0:
+        print(json.dumps({"event": "training_data_filter", **data_filter}), flush=True)
     device_name = cfg.device
     if world > 1 and cfg.device.split(":")[0] in {"cuda", "npu"}:
         device_name = f"{cfg.device.split(':')[0]}:{local_rank}"
@@ -179,9 +188,6 @@ def train(cfg: TrainConfig):
     wrapped = DistributedDataParallel(task, device_ids=[device.index] if device.type != "cpu" else None) if world > 1 else task
     optimizer = torch.optim.AdamW([p for p in draft.parameters() if p.requires_grad],
                                   lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    data = load_records(cfg.data, cfg.split)
-    if not len(data):
-        raise ValueError("Empty dataset")
     data_fingerprint = getattr(data, "_fingerprint", None)
     sampler = None
     steps_per_epoch = None
@@ -199,7 +205,7 @@ def train(cfg: TrainConfig):
         if state["world_size"] != world or state["data_fingerprint"] != data_fingerprint:
             raise ValueError("Exact resume requires the same world size and dataset fingerprint")
         operational = {"output", "resume", "initialize_dflash", "device", "checkpoint_every", "log_every",
-                       "max_steps", "tensorboard", "vllm_endpoint", "hidden_states_dir"}
+                       "max_steps", "tensorboard", "vllm_endpoint", "hidden_states_dir", "data_cache_dir"}
         current = asdict(cfg)
         previous_config = asdict(TrainConfig(**state["train_config"]))
         changes = [k for k, value in previous_config.items() if k not in operational and current[k] != value]
@@ -217,6 +223,7 @@ def train(cfg: TrainConfig):
         settings = {**asdict(cfg), "world_size": world, "data_fingerprint": data_fingerprint,
                     "target_commit": getattr(target.config, "_commit_hash", None),
                     "dataset_rows": len(data), "total_steps": total_steps,
+                    "data_filter": data_filter,
                     "steps_per_epoch": steps_per_epoch, "training_blocks_per_sequence": 1}
         record(output, "train", settings)
         (output / "train_config.json").write_text(json.dumps(asdict(cfg), indent=2) + "\n")

@@ -37,6 +37,7 @@ def build_config(env):
         vllm_endpoint=f"http://127.0.0.1:{int(env.get('PORT', '8080'))}/v1",
         hidden_states_dir=str(output / "hidden_states"), request_timeout=180, max_retries=8,
         initialize_dflash=env.get("DFLASH_INIT") or None, resume=env.get("RESUME") or None,
+        data_cache_dir=env.get("DATA_CACHE_DIR") or None,
     )
     return config
 

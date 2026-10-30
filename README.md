@@ -20,7 +20,7 @@ This uses the paths found in the supplied repository's existing training scripts
 
 ```bash
 MODEL=/home/n84449292/m84379596/Huggingface/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c
-DATASET=/home/n84449292/m84379596/Huggingface/open_perfectblend.qwen3-4b-rollout.qwen3.seq3072
+DATASET=/home/n84449292/m84379596/Huggingface/datasets/open_perfectblend.qwen3-4b-rollout.qwen3.seq3072
 ```
 
 Existing exported `MODEL` and `DATASET` values take precedence. The launcher validates both local paths on your server. It sources CANN/ATB in the ABI-aware order from your script and uses the existing environment; it does not install or downgrade packages. `VLLM_SOURCE_ROOT` defaults to your original `attention_prefix_head` checkout, which supplies the working vLLM/vLLM-Ascend code. Four-anchor trainer and regular DFlash source come from this branch.
@@ -34,7 +34,7 @@ Existing exported `MODEL` and `DATASET` values take precedence. The launcher val
 | Conditioning anchors | 4 |
 | New tokens per pass | 16; 20 query positions total |
 | Sequence length | 3072 |
-| Epochs | 5 complete shuffled dataset passes |
+| Epochs | 5 complete shuffled passes over trainable dataset rows |
 | Learning rate / schedule | 0.0006 / cosine; 50 warmup optimizer steps by default |
 | Precision / seed | BF16 autocast with FP32 trainable/master weights / 42 |
 | Gradient accumulation | 1 sequence per rank per update by default; `GRADIENT_ACCUMULATION` overrides |
@@ -43,7 +43,11 @@ Existing exported `MODEL` and `DATASET` values take precedence. The launcher val
 
 The supplied script's **causal final layer is not enabled**: this experiment remains regular DFlash. Its `MAX_ANCHORS=512` is a cap on sampled *training blocks*, not four conditioning tokens. The current reference trainer samples **one block per sequence**; it records the legacy value in `launch_settings.json` and explicitly reports that it is not applied. This has substantially less supervision per sequence than the old packed 512-block recipe, so these runs are not compute- or token-matched baselines.
 
-The new epoch mode visits every dataset row once per epoch per distributed partition (with the standard DistributedSampler padding of at most `world_size-1` repeated rows). Each row samples one valid prediction start. The final accumulation group uses its actual size, and resume restores the same epoch position and RNG state. `MAX_STEPS=10` can stop a short trial without changing the five-epoch cosine schedule; remove it when resuming a full run.
+The new epoch mode visits every retained dataset row once per epoch per distributed partition (with the standard DistributedSampler padding of at most `world_size-1` repeated rows). Each row samples one valid prediction start. The final accumulation group uses its actual size, and resume restores the same epoch position and RNG state. `MAX_STEPS=10` can stop a short trial without changing the five-epoch cosine schedule; remove it when resuming a full run.
+
+Before model allocation and distributed sampler creation, training excludes rows with no positive loss weight at positions `1 .. SEQ_LENGTH-1` after truncation. This fixes the observed crash on dataset row `1218977`; no individual rank skips an optimizer step. The Arrow scan creates a small shared index cache under `output/.four_anchor_data_cache` (`DATA_CACHE_DIR` overrides), leaving the source dataset unchanged. A file lock allows one scan across all six ranks; subsequent runs reuse the cache for the same dataset fingerprint and sequence length. The console and provenance report input, retained, and dropped row counts. Epoch length and the cosine schedule use the retained count. Malformed masks still fail explicitly. A dataset entirely without usable supervision fails before model allocation.
+
+After applying this fix, start a new run if the previous run failed before its first checkpoint. Exact resume from a checkpoint whose dataset loses rows under the new filter is intentionally rejected because its sample order and epoch schedule differ. Resume between corrected runs remains supported, including with a different output/cache directory.
 
 The trainer keeps target decoder output indices `[1,9,17,25,33]`, zero-based as documented below. The supplied vLLM source includes embedding slot 0, so the launcher requests capture slots `[2,10,18,26,34]` with `--no-include-last-layer`. This translation makes remote training and HF inference use the same actual layer outputs.
 
@@ -62,7 +66,7 @@ RESUME=/path/to/run/checkpoints/checkpoint-000010 CHECK_ONLY=0 \
 DFLASH_INIT=/path/to/regular-dflash CHECK_ONLY=0 bash four_anchor/scripts/train_ascend.sh
 ```
 
-The run directory is `output/four_anchor_dflash_<timestamp>_<pid>/`. Logs are `train.log`, `target_server.log`, and `checkpoints/logs/four_anchor_dflash/`; the resolved configuration is `train_config.json`. The launcher owns and shuts down only its target-server process group. CPU tests exercise the remote-client contract against a tiny Qwen teacher; actual Ascend/vLLM and multi-NPU execution still need validation on your server.
+The run directory is `output/four_anchor_dflash_<timestamp>_<pid>/`. Logs are `train.log`, `target_server.log`, and `checkpoints/logs/four_anchor_dflash/`; the resolved configuration is `train_config.json`. The launcher owns and shuts down only its target-server process group. The supplied Ascend log confirms the live teacher check and training through step 30 before the unsupervised-row failure. The filter fix is tested on CPU; its full Ascend run remains to be validated.
 
 ## Exact algorithm
 

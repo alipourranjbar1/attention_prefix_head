@@ -3,7 +3,7 @@
 Validated on CPU with Python 3.12, PyTorch 2.10.0+cpu, Transformers 5.0.0,
 and the repository's pinned regular DFlash decoder implementation.
 
-- **64 tests passed.** These cover the D-Loop confidence score, four-anchor
+- **75 tests passed.** These cover the D-Loop confidence score, four-anchor
   token/state/position selection, padding, 20 query positions / 16 outputs,
   training gradients, frozen target weights, upstream regular-DFlash warm starts,
   checkpoint validation, cache rollback at multiple rejection positions, full
@@ -24,18 +24,27 @@ and the repository's pinned regular DFlash decoder implementation.
 - The added remote-teacher tests compare returned features and continuations
   with a real tiny Qwen3 model behind a mocked HTTP transport. They check token-ID
   validation, file cleanup, frozen embedding/head-only loading, and backward.
-- Epoch training visits all five rows of a tiny dataset in each epoch, handles
+- Epoch training excludes three unsupervised rows, visits all five retained
+  rows of the tiny dataset in each epoch, handles
   a partial accumulation group, checkpoints at epoch boundaries, and resumes
   from the middle of an epoch with bitwise-identical final weights. TensorBoard
   event files contain the expected loss values and optimizer-step indices.
 - The Ascend configuration builder checks the requested NPU split, paths,
   five epochs, sequence length 3072, learning rate 0.0006, and four-anchor layout.
+- Data-filter regressions cover empty rows, all-zero masks, supervision only at
+  token zero or beyond truncation, fractional/boolean weights, missing masks,
+  invalid masks, cache reuse, cache-path-independent fingerprints, and equal
+  six-rank sampler lengths. This sampler test does not launch HCCL processes.
+- The user-provided Ascend log shows a successful live vLLM contract check
+  (features `[1,16,12800]`, 16 continuation tokens) and distributed training logs
+  through step 30 before the row-1218977 failure. The revised filtering path
+  has not yet been rerun on the user's hardware.
 
 **Not validated:** full Qwen3-4B training, acceptance improvements, accelerator
-speedup, live vLLM teacher integration, CUDA/NPU kernels, and multiworker distributed execution. A two-worker
-CPU run was attempted, but Gloo initialization failed with `Operation not
-permitted` under the environment's network restrictions. That result is not a
-distributed-training pass.
+speedup, CUDA execution, and a complete Ascend run with the filter fix. An earlier
+two-worker CPU run was attempted here, but Gloo initialization failed with
+`Operation not permitted` under the environment's network restrictions. That
+local attempt is not a distributed-training pass.
 
 The tiny target is randomly initialized. Its two-step training and timing
 numbers test execution and correctness; they are not useful quality or

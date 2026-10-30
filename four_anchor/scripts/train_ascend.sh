@@ -17,7 +17,7 @@ if [[ -n "${CANN_ROOT:-}" ]]; then
 fi
 set -u
 export MODEL="${MODEL:-/home/n84449292/m84379596/Huggingface/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c}"
-export DATASET="${DATASET:-/home/n84449292/m84379596/Huggingface/open_perfectblend.qwen3-4b-rollout.qwen3.seq3072}"
+export DATASET="${DATASET:-/home/n84449292/m84379596/Huggingface/datasets/open_perfectblend.qwen3-4b-rollout.qwen3.seq3072}"
 VLLM_SOURCE_ROOT="${VLLM_SOURCE_ROOT:-/home/n84449292/a84384644/attention_head_forked/attention_prefix_head}"
 export PYTHONPATH="$FOUR_ANCHOR_ROOT:$SPEC_DIR/src:$SPEC_DIR/hs_connectors/src:$VLLM_SOURCE_ROOT/vllm:$VLLM_SOURCE_ROOT/vllm-ascend:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="${ATB_HOME_PATH:?ATB environment missing}/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
@@ -31,6 +31,7 @@ export EPOCHS="${EPOCHS:-5}" LR="${LR:-0.0006}" SEED="${SEED:-42}"
 export GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-1}" LOG_FREQ="${LOG_FREQ:-10}"
 export MAX_ANCHORS="${MAX_ANCHORS:-512}"  # recorded legacy value; NOT conditioning-anchor count
 export OUTPUT_DIR="${OUTPUT_DIR:-$FOUR_ANCHOR_ROOT/output/four_anchor_dflash_$(date +%Y%m%d_%H%M%S)_$$}"
+export DATA_CACHE_DIR="${DATA_CACHE_DIR:-$FOUR_ANCHOR_ROOT/output/.four_anchor_data_cache}"
 cd "$FOUR_ANCHOR_ROOT"
 python - <<'PY'
 import importlib.util

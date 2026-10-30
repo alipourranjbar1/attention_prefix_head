@@ -10,7 +10,7 @@ requires-python = ">=3.10"
 dependencies = [
   "transformers==5.0.0", "safetensors>=0.5", "pydantic>=2", "pydantic-settings",
   "loguru", "rich", "httpx", "openai>=2", "aiohttp", "protobuf",
-  "datasets>=4,<=5.0.1", "tqdm>=4.66.3,<=4.70.0", "fastapi", "uvicorn"
+  "datasets>=4,<=5.0.1", "tqdm>=4.66.3,<=4.70.0", "fastapi", "uvicorn", "filelock>=3"
 ]
 
 [project.optional-dependencies]

@@ -15,7 +15,11 @@ def test_epoch_coverage_partial_accumulation_and_exact_resume(components, tmp_pa
     target, _, _ = components
     module = importlib.import_module("four_anchor.train")
     data = Dataset.from_list([{"input_ids": [i + 1, 7, 8, 9, 10, 11, 12],
-                               "loss_mask": [0, 0, 1, 1, 1, 1, 1]} for i in range(5)])
+                               "loss_mask": [0, 0, 1, 1, 1, 1, 1]} for i in range(5)] + [
+        {"input_ids": [2, 3, 4], "loss_mask": [0, 0, 0]},
+        {"input_ids": [2, 3], "loss_mask": [1, 0]},
+        {"input_ids": [2] * 33, "loss_mask": [0] * 32 + [1]},
+    ])
     monkeypatch.setattr(module, "load_target", lambda *a, **kw: (target, None))
     monkeypatch.setattr(module, "load_records", lambda *a, **kw: data)
     seen = []

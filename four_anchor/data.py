@@ -1,5 +1,6 @@
 """Prompt ingestion, teacher-data preparation, and tokenized dataset loading."""
 from pathlib import Path
+import hashlib
 import json
 
 import torch
@@ -36,6 +37,82 @@ def load_records(path, split="train"):
         data = load_from_disk(str(path))
         return data[split] if isinstance(data, DatasetDict) else data
     return load_dataset("json", data_files=str(path), split="train")
+
+
+def _trainable_batch(batch, max_sequence_length):
+    """Arrow batch predicate: match training_example's usable prefix window.
+
+    Keep the scan in Arrow instead of decoding billions of tokens into Python.
+    Invalid schemas/weights are errors; a well-formed unsupervised row is not.
+    """
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    ids = batch["input_ids"].combine_chunks()
+    if ids.null_count:
+        raise ValueError("input_ids contains a null sequence")
+    ids = pc.list_slice(ids, 0, max_sequence_length)
+    lengths = pc.list_value_length(ids)
+    if "loss_mask" not in batch.column_names:
+        return pc.greater(lengths, 1).to_numpy(zero_copy_only=False)
+    masks = batch["loss_mask"].combine_chunks()
+    if masks.null_count:
+        raise ValueError("loss_mask contains a null sequence")
+    masks = pc.list_slice(masks, 0, max_sequence_length)
+    if pc.any(pc.not_equal(pc.list_value_length(masks), lengths)).as_py():
+        raise ValueError("loss_mask must align one-to-one with input_ids")
+    flat = pc.list_flatten(masks)
+    if flat.null_count:
+        raise ValueError("loss_mask contains a null weight")
+    weights = pc.cast(flat, pa.float64())
+    if pc.any(pc.invert(pc.is_finite(weights))).as_py() or pc.any(pc.less(weights, 0)).as_py():
+        raise ValueError("loss_mask weights must be finite and nonnegative")
+    # Position zero cannot be predicted from a nonempty prefix. The stop index
+    # also excludes supervision that disappears under training-time truncation.
+    candidates = pc.list_slice(masks, 1, max_sequence_length)
+    positive = pc.greater(pc.cast(pc.list_flatten(candidates), pa.float64()), 0)
+    parents = pc.filter(pc.list_parent_indices(candidates), positive)
+    keep = np.zeros(len(batch), dtype=bool)
+    keep[parents.to_numpy(zero_copy_only=False)] = True
+    return keep
+
+
+def filter_training_records(data, max_sequence_length, cache_dir):
+    """Cache a shared row-index filter before creating any distributed sampler.
+
+    The original dataset is read-only. A file lock lets all local DDP ranks use
+    one scan and the same retained rows. The fingerprint excludes output paths,
+    so a resumed run can use another cache directory without changing its data.
+    """
+    from filelock import FileLock
+
+    if not len(data):
+        raise ValueError("Empty dataset")
+    if "input_ids" not in data.column_names:
+        raise ValueError("Training needs tokenized input_ids; run `dflash4a prepare` first")
+    if max_sequence_length < 2:
+        raise ValueError("max_sequence_length must be at least two")
+    identity = {"filter_version": 1, "source_fingerprint": data._fingerprint,
+                "max_sequence_length": max_sequence_length}
+    fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    cache = Path(cache_dir).expanduser().resolve()
+    cache.mkdir(parents=True, exist_ok=True)
+    index_file = cache / f"trainable_{fingerprint}.arrow"
+    with FileLock(str(index_file) + ".lock"):
+        filtered = data.with_format("arrow").filter(
+            _trainable_batch, batched=True, batch_size=512,
+            fn_kwargs={"max_sequence_length": max_sequence_length},
+            cache_file_name=str(index_file), load_from_cache_file=True,
+            new_fingerprint=fingerprint, desc="Filtering rows without usable supervision",
+        ).with_format(None)
+        summary = {**identity, "input_rows": len(data), "trainable_rows": len(filtered),
+                   "dropped_rows": len(data) - len(filtered), "index_file": str(index_file)}
+        index_file.with_suffix(".json").write_text(json.dumps(summary, indent=2) + "\n")
+    if not len(filtered):
+        raise ValueError("No trainable rows: no positive loss_mask after a nonempty prefix within max_sequence_length")
+    # Preserve the original fingerprint/order when nothing was excluded.
+    return (data if len(filtered) == len(data) else filtered), summary
 
 
 def training_example(data, rng, num_proposals, max_sequence_length, vocab_size, device, row_index=None):
