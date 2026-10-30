@@ -29,6 +29,8 @@ and the repository's pinned regular DFlash decoder implementation.
   a partial accumulation group, checkpoints at epoch boundaries, and resumes
   from the middle of an epoch with bitwise-identical final weights. TensorBoard
   event files contain the expected loss values and optimizer-step indices.
+  The progress bar uses the filtered schedule, reaches the expected total,
+  shows the epoch, and resumes at the saved step.
 - The Ascend configuration builder checks the requested NPU split, paths,
   five epochs, sequence length 3072, learning rate 0.0006, and four-anchor layout.
 - Data-filter regressions cover empty rows, all-zero masks, supervision only at

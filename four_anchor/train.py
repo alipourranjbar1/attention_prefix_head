@@ -16,6 +16,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 import torch.distributed as dist
+from tqdm.auto import tqdm
 
 from .data import filter_training_records, load_records, training_example
 from .model import DraftConfig, FourAnchorDFlash, make_anchors, select_boundary
@@ -64,6 +65,7 @@ class TrainConfig:
     request_timeout: int = 180
     max_retries: int = 8
     data_cache_dir: str | None = None
+    progress: bool = True
 
     def __post_init__(self):
         if self.steps < 1 or self.gradient_accumulation < 1 or self.max_sequence_length < 2:
@@ -205,7 +207,7 @@ def train(cfg: TrainConfig):
         if state["world_size"] != world or state["data_fingerprint"] != data_fingerprint:
             raise ValueError("Exact resume requires the same world size and dataset fingerprint")
         operational = {"output", "resume", "initialize_dflash", "device", "checkpoint_every", "log_every",
-                       "max_steps", "tensorboard", "vllm_endpoint", "hidden_states_dir", "data_cache_dir"}
+                       "max_steps", "tensorboard", "vllm_endpoint", "hidden_states_dir", "data_cache_dir", "progress"}
         current = asdict(cfg)
         previous_config = asdict(TrainConfig(**state["train_config"]))
         changes = [k for k, value in previous_config.items() if k not in operational and current[k] != value]
@@ -233,6 +235,12 @@ def train(cfg: TrainConfig):
     if rank == 0 and cfg.tensorboard:
         from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(str(output / "logs" / "four_anchor_dflash"), purge_step=start_step if cfg.resume else None)
+    progress = None
+    if rank == 0 and cfg.progress:
+        progress = tqdm(total=stop_step, initial=start_step, desc="Training", unit="step",
+                        dynamic_ncols=True, mininterval=1.0,
+                        bar_format="{desc}: {percentage:5.1f}%|{bar}| {n_fmt}/{total_fmt} steps "
+                                   "[{elapsed}<{remaining}, {rate_fmt}{postfix}]")
 
     def save(step):
         path = output / f"checkpoint-{step:06d}"
@@ -269,8 +277,8 @@ def train(cfg: TrainConfig):
             if step < cfg.warmup_steps:
                 multiplier = (step + 1) / max(1, cfg.warmup_steps)
             else:
-                progress = (step - cfg.warmup_steps) / max(1, total_steps - cfg.warmup_steps)
-                multiplier = 0.5 * (1 + math.cos(math.pi * progress))
+                schedule_fraction = (step - cfg.warmup_steps) / max(1, total_steps - cfg.warmup_steps)
+                multiplier = 0.5 * (1 + math.cos(math.pi * schedule_fraction))
             for group in optimizer.param_groups:
                 group["lr"] = cfg.learning_rate * multiplier
             for micro, row_index in enumerate(row_indices):
@@ -297,7 +305,10 @@ def train(cfg: TrainConfig):
                        "learning_rate": optimizer.param_groups[0]["lr"], "grad_norm": float(grad_norm)}
                 if steps_per_epoch is not None:
                     row["epoch"] = (step + 1) / steps_per_epoch
-                print(json.dumps(row), flush=True)
+                if progress is not None:
+                    progress.write(json.dumps(row))
+                else:
+                    print(json.dumps(row), flush=True)
                 with (output / "metrics.jsonl").open("a") as stream:
                     stream.write(json.dumps(row) + "\n")
                 if writer is not None:
@@ -308,7 +319,15 @@ def train(cfg: TrainConfig):
             periodic = epoch_end if cfg.checkpoint_each_epoch else (step + 1) % cfg.checkpoint_every == 0
             if periodic or step + 1 == stop_step:
                 save(step + 1)
+            if progress is not None:
+                status = {"loss": f"{aggregates[0].item():.4f}"}
+                if steps_per_epoch is not None:
+                    status["epoch"] = f"{(step + 1) / steps_per_epoch:.4f}/{cfg.epochs}"
+                progress.set_postfix(status, refresh=False)
+                progress.update(1)
     finally:
+        if progress is not None:
+            progress.close()
         runner.close()
         if writer is not None:
             writer.close()

@@ -39,6 +39,7 @@ Existing exported `MODEL` and `DATASET` values take precedence. The launcher val
 | Precision / seed | BF16 autocast with FP32 trainable/master weights / 42 |
 | Gradient accumulation | 1 sequence per rank per update by default; `GRADIENT_ACCUMULATION` overrides |
 | Checkpoints / logging | Every epoch plus final/early stop; TensorBoard and `train.log` |
+| Progress bar | Rank 0 shows steps, percentage, elapsed time, ETA, loss and epoch |
 | Target server port | 8080 |
 
 The supplied script's **causal final layer is not enabled**: this experiment remains regular DFlash. Its `MAX_ANCHORS=512` is a cap on sampled *training blocks*, not four conditioning tokens. The current reference trainer samples **one block per sequence**; it records the legacy value in `launch_settings.json` and explicitly reports that it is not applied. This has substantially less supervision per sequence than the old packed 512-block recipe, so these runs are not compute- or token-matched baselines.
@@ -48,6 +49,8 @@ The new epoch mode visits every retained dataset row once per epoch per distribu
 Before model allocation and distributed sampler creation, training excludes rows with no positive loss weight at positions `1 .. SEQ_LENGTH-1` after truncation. This fixes the observed crash on dataset row `1218977`; no individual rank skips an optimizer step. The Arrow scan creates a small shared index cache under `output/.four_anchor_data_cache` (`DATA_CACHE_DIR` overrides), leaving the source dataset unchanged. A file lock allows one scan across all six ranks; subsequent runs reuse the cache for the same dataset fingerprint and sequence length. The console and provenance report input, retained, and dropped row counts. Epoch length and the cosine schedule use the retained count. Malformed masks still fail explicitly. A dataset entirely without usable supervision fails before model allocation.
 
 After applying this fix, start a new run if the previous run failed before its first checkpoint. Exact resume from a checkpoint whose dataset loses rows under the new filter is intentionally rejected because its sample order and epoch schedule differ. Resume between corrected runs remains supported, including with a different output/cache directory.
+
+The progress bar covers all planned training updates, including all five epochs, and starts at the restored optimizer step on resume. Its ETA is estimated from observed update time and may fluctuate during warmup. With `MAX_STEPS`, it shows progress to that early-stop limit. Set `SHOW_PROGRESS=0` to disable the bar; JSON metrics and TensorBoard continue unchanged.
 
 The trainer keeps target decoder output indices `[1,9,17,25,33]`, zero-based as documented below. The supplied vLLM source includes embedding slot 0, so the launcher requests capture slots `[2,10,18,26,34]` with `--no-include-last-layer`. This translation makes remote training and HF inference use the same actual layer outputs.
 

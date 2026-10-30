@@ -1,5 +1,6 @@
 from dataclasses import replace
 import importlib
+import io
 import json
 
 import pytest
@@ -14,6 +15,13 @@ from four_anchor.train import TrainConfig
 def test_epoch_coverage_partial_accumulation_and_exact_resume(components, tmp_path, monkeypatch):
     target, _, _ = components
     module = importlib.import_module("four_anchor.train")
+    bars = []
+    real_progress = module.tqdm
+    def capture_progress(*args, **kwargs):
+        bar = real_progress(*args, **kwargs, file=io.StringIO())
+        bars.append(bar)
+        return bar
+    monkeypatch.setattr(module, "tqdm", capture_progress)
     data = Dataset.from_list([{"input_ids": [i + 1, 7, 8, 9, 10, 11, 12],
                                "loss_mask": [0, 0, 1, 1, 1, 1, 1]} for i in range(5)] + [
         {"input_ids": [2, 3, 4], "loss_mask": [0, 0, 0]},
@@ -46,6 +54,9 @@ def test_epoch_coverage_partial_accumulation_and_exact_resume(components, tmp_pa
     full = load_file(str(tmp_path / "full/checkpoint-000006/model.safetensors"))
     actual = load_file(str(tmp_path / "resumed/checkpoint-000006/model.safetensors"))
     assert all(torch.equal(full[k], actual[k]) for k in full)
+    assert [(bar.initial, bar.n, bar.total) for bar in bars] == [(0, 6, 6), (0, 2, 2), (2, 6, 6)]
+    assert "epoch=2.0000/2" in bars[-1].postfix
+    assert "6/6 steps" in bars[-1].fp.getvalue()
 
 
 def test_ascend_recipe_matches_user_settings(tmp_path):
@@ -62,6 +73,6 @@ def test_ascend_recipe_matches_user_settings(tmp_path):
     assert (cfg.num_anchors, cfg.num_proposals, cfg.num_draft_layers) == (4, 16, 5)
     assert cfg.target_layer_ids == [1, 9, 17, 25, 33]
     assert cfg.vllm_endpoint == "http://127.0.0.1:8080/v1"
-    assert cfg.tensorboard and cfg.checkpoint_each_epoch
+    assert cfg.tensorboard and cfg.checkpoint_each_epoch and cfg.progress
     with pytest.raises(ValueError, match="disjoint"):
         build_config({**env, "TRAIN_NPUS": "1,2"})
