@@ -7,6 +7,15 @@
 !/speculators/
 !/vllm/
 !/vllm-ascend/
+!/four_anchor/
+!/pyproject.toml
+!/README_FOUR_ANCHOR.md
+
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+/four_anchor/runs/
 
 # Never track evaluation results
 /Evaluator/results/
