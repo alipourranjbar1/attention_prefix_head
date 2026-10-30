@@ -57,7 +57,8 @@ def test_packed_forward_and_gradient_match_independent_blocks(components, checkp
     torch.testing.assert_close(expected_grad, draft.layers[0].self_attn.q_proj.weight.grad, atol=5e-5, rtol=1e-3)
 
 
-def test_second_pass_uses_draft_states_and_cannot_read_future_or_other_documents(components):
+@pytest.mark.parametrize("cached", [False, True])
+def test_second_pass_uses_draft_states_and_cannot_read_future_or_other_documents(components, cached):
     _, draft, _ = components
     batch = batch_for(components)
     starts, docs, keep = torch.tensor([3]), torch.tensor([0]), 5
@@ -69,7 +70,8 @@ def test_second_pass_uses_draft_states_and_cannot_read_future_or_other_documents
     assert a2.positions.tolist() == [[4, 5, 6, 7]]
     assert not a2.draft_features.requires_grad
     def run(features):
-        return draft.packed_hidden(features[None], batch["positions"], batch["documents"], a2, starts + keep, starts, docs)
+        memory = draft.packed_memory(features[None], batch["positions"]) if cached else None
+        return draft.packed_hidden(features[None], batch["positions"], batch["documents"], a2, starts + keep, starts, docs, memory=memory)
     expected = run(batch["features"])
     modified = batch["features"].clone()
     modified[3:] = torch.randn_like(modified[3:]) * 100
@@ -134,7 +136,8 @@ def test_packing_covers_rows_once_and_distributes_equal_step_counts(tmp_path):
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_actual_packed_two_epoch_training_and_exact_resume(components, tmp_path, monkeypatch, dtype):
+@pytest.mark.parametrize("execution", ["reference", "cached"])
+def test_actual_packed_two_epoch_training_and_exact_resume(components, tmp_path, monkeypatch, dtype, execution):
     target, _, _ = components
     if dtype == "bfloat16":
         target.to(torch.bfloat16)
@@ -146,7 +149,8 @@ def test_actual_packed_two_epoch_training_and_exact_resume(components, tmp_path,
     monkeypatch.setattr(module, "load_target", lambda *a: (target, None))
     cfg = replace(tiny_config(), dtype=dtype, output=str(tmp_path / "full"), num_proposals=4,
                   max_anchors=4, gradient_accumulation=2, checkpoint_each_epoch=True,
-                  warmup_steps=0, progress=False, data_cache_dir=str(tmp_path / "cache"))
+                  warmup_steps=0, progress=False, data_cache_dir=str(tmp_path / "cache"), packed_execution=execution,
+                  profile_steps=1)
     full = module.train_packed(cfg)
     state = torch.load(full + "/trainer.pt", weights_only=True)
     assert state["steps_per_epoch"] == [2, 2]

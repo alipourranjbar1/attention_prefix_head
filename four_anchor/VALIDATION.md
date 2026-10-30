@@ -1,7 +1,7 @@
 # Validation of packed training and DSpark loss
 
 Validated on CPU with Python 3.12, PyTorch 2.10.0+cpu, Transformers 5.0.0,
-and the pinned regular DFlash decoder implementation. **91 tests passed.**
+and the pinned regular DFlash decoder implementation. **109 tests passed.**
 
 The new packed tests verify:
 
@@ -62,3 +62,19 @@ numbers of chunks and checks FULL_SHARD storage, finite gradients, collective
 checkpointing, and equivalent continuation after restore. Its result and logs
 are saved under the run directory. Actual NPU compatibility and throughput
 remain hardware checks, not results established by the CPU suite.
+
+## Cached execution and timing update
+
+The optimized path is compared with the reference for CE/TV/KL values and hidden
+gradients in FP32/BF16, including the minimum-function tie case for TV. Tests
+compare cached context forward outputs and gradients of all backbone parameters,
+check exactly one full-context projection, and verify that a mixed group only
+redrafts positive-boundary blocks while retaining both losses for every block.
+Future/cross-document isolation, full tiny-model training and exact resume are
+exercised under both reference and cached execution. The single-rank FSDP
+checkpoint tests now use cached execution too.
+
+These are CPU correctness tests. Neither the reported approximately 12-second
+NPU step time nor a 10-hour target has been benchmarked on the updated code here.
+The launcher records real synchronized phase timings for the first five server
+training updates; this is necessary to establish hardware throughput.

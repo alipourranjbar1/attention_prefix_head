@@ -206,7 +206,7 @@ class FourAnchorDFlash(nn.Module):
         save_file(state, str(path / "model.safetensors"))
 
     def packed_hidden(self, features, context_positions, document_ids, anchors,
-                      starts, context_limits, block_documents):
+                      starts, context_limits, block_documents, memory=None):
         """Independent blocks sharing packed context memory; no cross-document KV.
 
         starts/context_limits are *document-relative* positions. Pass two moves
@@ -223,7 +223,7 @@ class FourAnchorDFlash(nn.Module):
         df = self.draft_anchor_norm(self.draft_anchor_proj(anchors.draft_features))
         feature = tf * (anchors.source == 1)[..., None] + df * (anchors.source == 2)[..., None]
         x = (x + torch.cat([feature, torch.zeros_like(x[:, a:])], 1)).reshape(1, g * (a + m), -1)
-        context = self.hidden_norm(self.fc(features))
+        context = self.hidden_norm(self.fc(features)) if memory is None else None
         query_positions = torch.cat([anchors.positions, starts[:, None] + torch.arange(m, device=device)], -1)
         positions = torch.cat([context_positions[None], query_positions.reshape(1, -1)], -1)
         rope = self.rotary_emb(x, positions)
@@ -235,16 +235,66 @@ class FourAnchorDFlash(nn.Module):
         allowed = torch.cat([ctx_ok.repeat_interleave(a + m, 0), query_ok], -1)
         mask = torch.zeros((1, 1, *allowed.shape), device=device, dtype=x.dtype)
         mask.masked_fill_(~allowed[None, None], torch.finfo(x.dtype).min)
-        for layer in self.layers:
-            def run(h, ctx, layer=layer):
-                return layer(hidden_states=h, target_hidden=ctx, attention_mask=mask,
-                             position_ids=positions, position_embeddings=rope, use_cache=False)
+        for index, layer in enumerate(self.layers):
+            if memory is None:
+                def run(h, ctx, layer=layer):
+                    return layer(hidden_states=h, target_hidden=ctx, attention_mask=mask,
+                                 position_ids=positions, position_embeddings=rope, use_cache=False)
+                args = (x, context)
+            else:
+                def run(h, k, v, layer=layer):
+                    return self._cached_layer(layer, h, k, v, mask, rope)
+                args = (x, *memory[index])
             if self.gradient_checkpointing and self.training:
                 from torch.utils.checkpoint import checkpoint
-                x = checkpoint(run, x, context, use_reentrant=False)
+                x = checkpoint(run, *args, use_reentrant=False)
             else:
-                x = run(x, context)
+                x = run(*args)
         return self.norm(x.reshape(g, a + m, -1)[:, a:])
+
+    def packed_memory(self, features, positions):
+        """Project shared context and each layer's K/V once, with gradients intact."""
+        from speculators.models.dflash.model_definitions import _rotate_half
+        context = self.hidden_norm(self.fc(features))
+        cos, sin = self.rotary_emb(context, positions[None])
+        cos, sin = cos[:, None], sin[:, None]
+        memory = []
+        for layer in self.layers:
+            attention = layer.self_attn
+            shape = (*context.shape[:2], -1, attention.head_dim)
+            k = attention.k_norm(attention.k_proj(context).view(shape)).transpose(1, 2)
+            k = k * cos + _rotate_half(k) * sin
+            v = attention.v_proj(context).view(shape).transpose(1, 2)
+            memory.append((k, v))
+        return memory
+
+    @staticmethod
+    def _cached_layer(layer, hidden, context_k, context_v, mask, rope):
+        """The pinned DFlash layer equations, reusing only its context projections.
+
+        No parameters or state-dict keys are added. The normal inference layer
+        remains unchanged. Context K/V retain their graph for shared gradients.
+        """
+        from speculators.models.dflash.model_definitions import (
+            ALL_ATTENTION_FUNCTIONS, eager_attention_forward, apply_rotary_pos_emb,
+        )
+        residual = hidden
+        x = layer.input_layernorm(hidden)
+        attention = layer.self_attn
+        b, length = x.shape[:2]
+        shape = (b, length, -1, attention.head_dim)
+        q = attention.q_norm(attention.q_proj(x).view(shape)).transpose(1, 2)
+        k = attention.k_norm(attention.k_proj(x).view(shape)).transpose(1, 2)
+        v = attention.v_proj(x).view(shape).transpose(1, 2)
+        cos, sin = rope
+        q, k = apply_rotary_pos_emb(q, k, cos[:, -length:], sin[:, -length:])
+        k, v = torch.cat([context_k, k], -2), torch.cat([context_v, v], -2)
+        implementation = attention.config._attn_implementation
+        fn = eager_attention_forward if implementation in {None, "eager"} else ALL_ATTENTION_FUNCTIONS[implementation]
+        value = fn(attention, q, k, v, mask, dropout=0., scaling=attention.scaling,
+                   sliding_window=attention.sliding_window)[0]
+        hidden = residual + attention.o_proj(value.reshape(b, length, -1))
+        return hidden + layer.mlp(layer.post_attention_layernorm(hidden))
 
     @classmethod
     def load(cls, path, target, trainable_dtype=None):

@@ -74,6 +74,8 @@ class TrainConfig:
     num_workers: int = 4
     loss_fn: dict | None = None
     distributed_strategy: str = "ddp"
+    packed_execution: str = "reference"
+    profile_steps: int = 0
 
     def __post_init__(self):
         if self.steps < 1 or self.gradient_accumulation < 1 or self.max_sequence_length < 2:
@@ -98,6 +100,8 @@ class TrainConfig:
             raise ValueError("training_mode must be online or packed")
         if self.distributed_strategy not in {"ddp", "fsdp"}:
             raise ValueError("distributed_strategy must be ddp or fsdp")
+        if self.packed_execution not in {"reference", "cached"} or self.profile_steps < 0:
+            raise ValueError("Invalid packed_execution/profile_steps")
         if self.distributed_strategy == "fsdp" and self.training_mode != "packed":
             raise ValueError("FSDP is supported by the packed trainer")
         if min(self.max_anchors, self.blocks_per_chunk, self.head_chunk_size) < 1 or self.num_workers < 0:

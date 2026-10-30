@@ -32,7 +32,8 @@ export GRADIENT_ACCUMULATION="${GRADIENT_ACCUMULATION:-1}" LOG_FREQ="${LOG_FREQ:
 export MAX_ANCHORS="${MAX_ANCHORS:-1536}"  # sampled blocks per packed batch; four anchors inside each block
 export DISTRIBUTED_STRATEGY="${DISTRIBUTED_STRATEGY:-fsdp}"
 export NUM_WORKERS="${NUM_WORKERS:-4}" TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.9}"
-export BLOCKS_PER_CHUNK="${BLOCKS_PER_CHUNK:-32}" HEAD_CHUNK_SIZE="${HEAD_CHUNK_SIZE:-64}"
+export BLOCKS_PER_CHUNK="${BLOCKS_PER_CHUNK:-128}" HEAD_CHUNK_SIZE="${HEAD_CHUNK_SIZE:-256}"
+export PACKED_EXECUTION="${PACKED_EXECUTION:-cached}" PROFILE_STEPS="${PROFILE_STEPS:-5}"
 if [[ -z "${LOSS_FN:-}" ]]; then export LOSS_FN='{"ce":0.1,"tv":0.9}'; fi
 export OUTPUT_DIR="${OUTPUT_DIR:-$FOUR_ANCHOR_ROOT/output/four_anchor_dflash_$(date +%Y%m%d_%H%M%S)_$$}"
 export DATA_CACHE_DIR="${DATA_CACHE_DIR:-$FOUR_ANCHOR_ROOT/output/.four_anchor_data_cache}"
@@ -85,6 +86,7 @@ if [[ "$DISTRIBUTED_STRATEGY" == fsdp ]]; then
         --nnodes=1 --nproc_per_node="${#train_devices[@]}" \
         --master_addr=127.0.0.1 --master_port="${MASTER_PORT:-29647}" \
         -m four_anchor.fsdp_check --device npu --dtype bfloat16 \
+        --packed-execution "$PACKED_EXECUTION" \
         --output "$OUTPUT_DIR/fsdp_check" 2>&1 | tee "$OUTPUT_DIR/fsdp_check.log"
 fi
 server_pid=''

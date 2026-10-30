@@ -21,7 +21,7 @@ from .runtime import resolve_device
 from .train import TrainConfig
 
 
-def run_check(device, output, dtype="bfloat16"):
+def run_check(device, output, dtype="bfloat16", packed_execution="cached"):
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.manual_seed(193)
     # Keep a conventional accelerator attention head size (128), while making
@@ -39,7 +39,7 @@ def run_check(device, output, dtype="bfloat16"):
     cfg = TrainConfig("fsdp-preflight", "synthetic", str(output), 63, [0, 1], device=str(device), dtype=dtype,
                       training_mode="packed", distributed_strategy="fsdp", epochs=1, num_workers=0,
                       num_proposals=4, max_anchors=16, blocks_per_chunk=2, head_chunk_size=7,
-                      max_sequence_length=32, loss_fn={"ce": .1, "tv": .9})
+                      max_sequence_length=32, loss_fn={"ce": .1, "tv": .9}, packed_execution=packed_execution)
     task = PackedTask(draft, target.model.norm, cfg, random.Random(321 + rank)).train()
     full_elements = sum(p.numel() for p in draft.parameters() if p.requires_grad)
     wrapped = wrap_task(task, "fsdp", device, dtype, world)
@@ -100,7 +100,7 @@ def run_check(device, output, dtype="bfloat16"):
         result = {"status": "passed", "world_size": world, "device": str(device), "dtype": dtype,
                   "sharding": "FULL_SHARD" if world > 1 else "NO_SHARD (single-rank unit test)",
                   "rank0_trainable_elements": local_elements, "full_trainable_elements": full_elements,
-                  "first_global_grad_norm": norm, "checkpoint_continuation": "matched"}
+                  "first_global_grad_norm": norm, "checkpoint_continuation": "matched", "packed_execution": packed_execution}
         (output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result), flush=True)
     dist.barrier()
@@ -111,12 +111,13 @@ def main():
     parser.add_argument("--device", default="npu")
     parser.add_argument("--output", required=True)
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
+    parser.add_argument("--packed-execution", choices=["reference", "cached"], default="cached")
     args = parser.parse_args()
     device = resolve_device(f"{args.device}:{os.environ.get('LOCAL_RANK', '0')}" if args.device != "cpu" else "cpu")
     dist.init_process_group(backend={"npu": "hccl", "cuda": "nccl"}.get(device.type, "gloo"),
                             timeout=timedelta(seconds=180))
     try:
-        run_check(device, args.output, args.dtype)
+        run_check(device, args.output, args.dtype, args.packed_execution)
     finally:
         dist.destroy_process_group()
 

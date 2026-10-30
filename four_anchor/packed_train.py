@@ -17,7 +17,7 @@ from .model import DraftConfig, FourAnchorDFlash
 from .packed_data import TeacherRecords, collate_documents, epoch_batches, prepare_records, schedule
 from .packed_objective import PackedTask
 from .provenance import record, checkpoint_hashes
-from .runtime import TargetRunner, load_target, resolve_device
+from .runtime import TargetRunner, load_target, resolve_device, synchronize
 from .distributed import wrap_task, checkpoint_states, restore_optimizer, clip_grad_norm
 
 
@@ -108,7 +108,7 @@ def train_packed(cfg):
         previous = asdict(TrainConfig(**state["train_config"]))
         operational = {"output", "resume", "initialize_dflash", "device", "checkpoint_every", "log_every",
                        "max_steps", "tensorboard", "vllm_endpoint", "hidden_states_dir", "data_cache_dir",
-                       "progress", "num_workers"}
+                       "progress", "num_workers", "profile_steps"}
         changes = [k for k, v in previous.items() if k not in operational and asdict(cfg)[k] != v]
         if changes or previous["training_mode"] != "packed":
             raise ValueError(f"Resume recipe differs: {changes}; use a fresh run for the packed objective")
@@ -186,6 +186,9 @@ def train_packed(cfg):
                             mininterval=1, disable=rank != 0 or not cfg.progress)
             try:
                 while offset < len(batches) and step < stop_step:
+                    profile = step - initial_step < cfg.profile_steps
+                    phase_times = [0., 0., 0., 0.]
+                    redraft_blocks = 0
                     accumulation = min(cfg.gradient_accumulation, len(batches) - offset)
                     optimizer.zero_grad(set_to_none=True)
                     if step < cfg.warmup_steps:
@@ -197,17 +200,34 @@ def train_packed(cfg):
                         group["lr"] = cfg.learning_rate * multiplier
                     metrics = torch.zeros(13, device=device)
                     for micro in range(accumulation):
+                        if profile:
+                            synchronize(device)
+                        tick = time.perf_counter()
                         batch = {k: v.to(device=device) for k, v in next(iterator).items()}
+                        if profile:
+                            synchronize(device)
+                        phase_times[0] += time.perf_counter() - tick
                         if batch["ids"].numel() > cfg.max_sequence_length:
                             raise ValueError("Packed batch exceeds the per-rank token budget")
                         sync = wrapped.no_sync() if world > 1 and micro + 1 < accumulation else nullcontext()
                         with sync:
+                            tick = time.perf_counter()
                             with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=cfg.dtype == "bfloat16"):
                                 numerator, denominator, values = wrapped(batch)
+                            if profile:
+                                synchronize(device)
+                            phase_times[1] += time.perf_counter() - tick
                             if not torch.isfinite(numerator) or denominator <= 0:
                                 raise FloatingPointError("Nonfinite or unsupervised packed loss")
+                            tick = time.perf_counter()
                             numerator.backward()
+                            if profile:
+                                synchronize(device)
+                            phase_times[2] += time.perf_counter() - tick
                         metrics += values
+                        redraft_blocks += task.last_redraft_blocks
+                    metrics = torch.cat([metrics, metrics.new_tensor([redraft_blocks])])
+                    tick = time.perf_counter()
                     if world > 1:
                         dist.all_reduce(metrics)
                     # DDP/FSDP averaged gradient sums by world size. Normalize by
@@ -218,15 +238,28 @@ def train_packed(cfg):
                             parameter.grad.mul_(scale)
                     grad_norm = clip_grad_norm(wrapped, draft, 1.0)
                     optimizer.step()
+                    if profile:
+                        synchronize(device)
+                    phase_times[3] = time.perf_counter() - tick
                     step += 1
                     offset += accumulation
                     elapsed = time.monotonic() - started
                     row = {"step": step, "total_steps": total_steps, "epoch": epoch + 1,
                            "step_in_epoch": math.ceil(offset / cfg.gradient_accumulation),
                            "steps_in_epoch": counts[epoch], **metric_row(metrics),
+                           "redraft_blocks_computed": metrics[13].item(),
                            "learning_rate": optimizer.param_groups[0]["lr"], "grad_norm": float(grad_norm),
                            "estimated_remaining_seconds": elapsed / (step - initial_step) * (total_steps - step)}
-                    if rank == 0 and step % cfg.log_every == 0:
+                    if cfg.packed_execution == "cached" and not (cfg.loss_fn or {}).get("kl_div", 0):
+                        row.pop("first_kl")
+                        row.pop("second_kl")
+                    if profile:
+                        times = torch.tensor(phase_times, device=device)
+                        if world > 1:
+                            dist.all_reduce(times, op=dist.ReduceOp.MAX)
+                        row.update(dict(zip(("max_rank_input_seconds", "max_rank_forward_seconds",
+                                             "max_rank_backward_seconds", "max_rank_optimizer_seconds"), times.tolist())))
+                    if rank == 0 and (step % cfg.log_every == 0 or profile):
                         row.update(memory_metrics(device))
                         progress.write(json.dumps(row))
                         with (output / "metrics.jsonl").open("a") as stream:

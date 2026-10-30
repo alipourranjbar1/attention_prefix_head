@@ -91,7 +91,11 @@ class PackedTask(nn.Module):
                 torch.cat(tokens).reshape(hidden.shape[:2]), torch.cat(confidence).reshape(hidden.shape[:2]))
 
     def forward(self, batch):
+        if self.cfg.packed_execution == "cached":
+            from .cached_objective import cached_forward
+            return cached_forward(self, batch)
         cfg, draft = self.cfg, self.drafter
+        self.last_redraft_blocks = 0
         eligible = ((batch["weights"] > 0) & (batch["positions"] > 0)).nonzero().flatten().tolist()
         if not eligible:
             raise ValueError("Packed batch has no trainable starts")
@@ -144,6 +148,7 @@ class PackedTask(nn.Module):
                 # has no dropout here, so reuse the exact view and its gradient.
                 w2, loss2, st2 = w1 * cfg.redraft_weight, loss1 * cfg.redraft_weight, st1 * cfg.redraft_weight
             else:
+                self.last_redraft_blocks += len(starts)
                 anchors2 = packed_anchors(batch, starts, second_starts, docs, draft.hidden_size,
                                           cfg.num_anchors, first, tokens)
                 second = draft.packed_hidden(batch["features"][None], batch["positions"], batch["documents"],
