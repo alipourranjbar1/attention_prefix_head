@@ -11,6 +11,8 @@ def test_serving_config_preserves_four_anchors_and_uses_native_worker(components
     options = engine_options(args)
     assert options["speculative_config"]["num_speculative_tokens"] == 15
     assert options["hf_overrides"]["four_anchor_serving"]["num_proposals"] == 15
+    assert options["block_size"] == 128
+    assert options["hf_overrides"]["four_anchor_serving"]["trace_steps"] is False
     assert "additional_config" not in options  # Ascend forbids foreign keys here.
     command = server_command(options, "127.0.0.1", 8095)
     for flag in ("--worker-cls", "--no-enable-prefix-caching", "--no-enable-chunked-prefill",

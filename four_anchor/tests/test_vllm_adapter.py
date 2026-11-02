@@ -36,69 +36,40 @@ def adapter(monkeypatch):
     return module
 
 
-@pytest.mark.parametrize("accepted", [0, 1, 7, 15])
-def test_native_propose_excludes_rejected_states_and_materializes_bonus(adapter, monkeypatch, accepted):
+@pytest.mark.parametrize("accepted", range(16))
+def test_propose_uses_only_past_states_and_never_calls_target(adapter, monkeypatch, accepted):
     runner = adapter.FourAnchorNPUModelRunner.__new__(adapter.FourAnchorNPUModelRunner)
     history = FeatureHistory(128, 2, "cpu", torch.float32)
-    history.update("request", 0, torch.arange(5), torch.zeros(5, 2))
-    runner.drafter = NS(history=history, layer_ids=[0, 1], model=object(),
-                        settings=NS(num_proposals=15, mode="two_pass"))
+    history.update("request", 0, torch.arange(4), torch.zeros(4, 2))
+    observed = {}
+    def update(req, start, features):
+        observed["cache"] = (req, start, features.clone())
+    def propose(ids, bonus, mode):
+        observed["ids"] = ids.clone()
+        observed["bonus"] = bonus.clone()
+        return torch.arange(15)[None], torch.tensor([3])
+    inference = NS(cache=NS(update=update), propose=propose,
+                   profiler=NS(region=lambda _: nullcontext(), finish=lambda: None))
+    runner.drafter = NS(history=history, layer_ids=[0, 1], inference=inference,
+                        settings=NS(num_proposals=15, mode="two_pass", trace_steps=False))
     runner.input_batch = NS(num_reqs=1, req_ids=["request"])
     runner.input_ids = NS(gpu=torch.arange(40, 56))
-    runner._get_positions = lambda _: torch.arange(4, 20)
-    runner.max_model_len = 128
-    observed = {}
-
-    def materialize(token, position, common):
-        observed["bonus"] = (token, position)
-        return torch.tensor([token]), torch.tensor([[900., 901.]])
-
-    def proposal(model, ids, features, mode):
-        observed["ids"] = ids.clone()
-        observed["features"] = features.clone()
-        return torch.arange(15)[None], 3
-
-    runner._materialize_bonus = materialize
-    monkeypatch.setattr(adapter, "fixed_window_proposal", proposal)
+    runner.max_model_len, runner.device = 128, "cpu"
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No extra target forward or device position readback")
+    runner.model = forbidden
+    runner._get_positions = forbidden
     output = runner.propose_draft_token_ids(
         [list(range(41, 41 + accepted)) + [60]], NS(all_greedy=True), None,
-        NS(num_draft_tokens=[15]), object(), None, 16, None,
+        NS(num_draft_tokens=[15]), NS(num_computed_tokens_cpu=torch.tensor([4])), None, 16, None,
         [torch.arange(16).float()[:, None], (torch.arange(16) + 100).float()[:, None]],
     )
     assert output == [list(range(15))]
-    assert observed["bonus"] == (60, 5 + accepted)
-    assert observed["ids"].tolist() == [list(range(4)) + list(range(40, 41 + accepted)) + [60]]
-    assert observed["features"].shape[1] == 6 + accepted
-    assert observed["features"][0, -1].tolist() == [900., 901.]
-    assert observed["features"][0, 4:-1, 0].tolist() == list(range(accepted + 1))
-
-
-def test_bonus_uses_allocated_slot_and_shortened_kv_length(adapter):
-    runner = adapter.FourAnchorNPUModelRunner.__new__(adapter.FourAnchorNPUModelRunner)
-    calls = []
-
-    class Builder:
-        def build(self, **kwargs):
-            calls.append(kwargs["common_attn_metadata"])
-            return object()
-
-    runner.attn_groups = [[NS(get_metadata_builder=lambda _: Builder(), layer_names=["layer0"])]]
-    runner.input_batch = NS(block_table=[NS(num_blocks_per_row=[2], block_size=4)])
-    runner.device, runner.vllm_config = "cpu", object()
-    runner.drafter = NS(layer_ids=[0, 1])
-    runner.model = lambda **kwargs: (None, [torch.ones(1, 2), torch.full((1, 2), 2.)])
-    common = NS(block_table_tensor=torch.tensor([[10, 20]], dtype=torch.int32))
-    ids, features = runner._materialize_bonus(51, 5, common)
-    assert ids.tolist() == [51]
-    assert features.tolist() == [[1., 1., 2., 2.]]
-    cm = calls[0]
-    assert cm.slot_mapping.tolist() == [81]  # page 20, offset 1
-    assert cm.seq_lens.tolist() == [6]       # rejected positions 6+ are invisible
-    assert cm.query_start_loc.tolist() == [0, 1]
-    assert cm.positions.tolist() == [5]
-    assert cm.causal
-    assert runner._materialize_bonus(52, 8, common) is None
-    assert len(calls) == 1  # never writes into an unallocated page
+    assert observed["bonus"].tolist() == [[60]]
+    assert observed["ids"].tolist() == [list(range(4)) + list(range(40, 41 + accepted))]
+    assert observed["cache"][1] == 4
+    assert observed["cache"][2][0, :, 0].tolist() == list(range(accepted + 1))
+    assert not hasattr(runner, "_materialize_bonus")
 
 
 def test_custom_class_constructor_accepts_upstream_config_only(adapter, components, tmp_path):

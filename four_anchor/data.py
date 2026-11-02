@@ -9,7 +9,7 @@ import torch
 def prompt_tokens(row, tokenizer, max_length=None):
     if "messages" in row:
         ids = tokenizer.apply_chat_template(row["messages"], tokenize=True,
-                                            add_generation_prompt=True, enable_thinking=False)
+                                            add_generation_prompt=True, enable_thinking=False, return_dict=False)
     elif "input_ids" in row:
         ids = list(row["input_ids"])
         # Prepared training records contain both prompt and completion.

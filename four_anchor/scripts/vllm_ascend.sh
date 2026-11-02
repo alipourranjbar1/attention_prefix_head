@@ -6,7 +6,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN="${RUN:-$ROOT/output/four_anchor_dflash_20261031_025300_2111006}"
 MODEL="${MODEL:-/home/n84449292/m84379596/Huggingface/models--Qwen--Qwen3-4B/snapshots/1cfa9a7208912126459214e8b04321603b3df60c}"
 DRAFT="${DRAFT:-$RUN/checkpoints/checkpoint-016699}"
-VLLM_SOURCE_ROOT="${VLLM_SOURCE_ROOT:-/home/n84449292/a84384644/attention_head_forked/attention_prefix_head}"
+VLLM_SOURCE_ROOT="${VLLM_SOURCE_ROOT:-$ROOT}"
 CANN_ROOT="${CANN_ROOT:-/home/n84449292/m84379596/CANN/9.1.0}"
 if [[ -f "$CANN_ROOT/cann/set_env.sh" ]]; then
     source "$CANN_ROOT/cann/set_env.sh"
@@ -40,9 +40,18 @@ for name, commit in expected.items():
 print('Pinned vLLM/Ascend source revisions verified', flush=True)
 PY
 command="${1:-evaluate}"
+if [[ "${TRACE_STEPS:-0}" != 0 && "${TRACE_STEPS:-0}" != 1 ]]; then
+    echo "TRACE_STEPS must be 0 or 1" >&2; exit 2
+fi
 args=("$command" --target "$MODEL" --checkpoint "$DRAFT" --mode "${MODE:-two_pass}"
       --proposals "${NUM_SPECULATIVE_TOKENS:-15}" --max-model-len "${MAX_MODEL_LEN:-4096}"
       --memory-fraction "${MEMORY_FRACTION:-0.8}")
+if [[ "${DRAFT_GRAPH:-0}" != 0 && "${DRAFT_GRAPH:-0}" != 1 ]]; then
+    echo "DRAFT_GRAPH must be 0 or 1" >&2; exit 2
+fi
+args+=(--profile-steps "${PROFILE_STEPS:-0}")
+if [[ "${DRAFT_GRAPH:-0}" == 1 ]]; then args+=(--draft-graph); fi
+if [[ "${TRACE_STEPS:-0}" == 1 ]]; then args+=(--trace-steps); fi
 if [[ "$command" == evaluate ]]; then
     DATA="${DATA:-$RUN/evaluation/epoch1_gsm8k_20261102_230727/prompts.jsonl}"
     OUTPUT_DIR="${OUTPUT_DIR:-$RUN/evaluation/vllm_${MODE:-two_pass}_$(date +%Y%m%d_%H%M%S)_$$}"

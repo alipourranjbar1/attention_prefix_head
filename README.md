@@ -1,10 +1,12 @@
+**Optimized vLLM Ascend inference:** see [four_anchor/VLLM.md](four_anchor/VLLM.md). The first pass uses 4 past anchors + 1 known bonus + 15 masks (20 positions). There is no extra target forward. Context K/V is cached, anchor selection stays on-device, and optional drafter graph replay is available. Verification receives 15 proposals; maximum acceptance with one bonus is 16. CPU tests pass; the new path needs NPU validation and measured speedup.
+
 ## vLLM four-anchor inference update
 
 See [the vLLM guide](four_anchor/VLLM.md): four conditioning anchors, 15 speculative candidates, and acceptance including one bonus capped at 16. The target and verification run in vLLM; the drafter uses PyTorch SDPA inside the worker. CPU logic checks pass; Ascend execution requires hardware validation.
 
 # Four-anchor DFlash pipeline
 
-Branch: **`four-anchor-dflash-pipeline`**. This root README is the branch landing page on GitHub.
+Branch: **`four-anchor-only-embedding`**.
 
 This implements **one shared regular DFlash drafter**, four explicit anchors, and two draft passes. Each pass has **4 anchor slots + 16 masked generation slots = 20 query positions** and predicts **16 new tokens**. It includes data preparation, training and resume, greedy inference, evaluation, HTTP serving, CPU tests, and launch scripts.
 
@@ -265,3 +267,10 @@ bash four_anchor/scripts/pipeline.sh
 ```
 
 This prepares teacher data, trains, reads the final checkpoint path, evaluates, and generates a sample. Set `PREPARED_DATA=/data/existing_teacher_tokens` to skip preparation. Serving is a separate command because it is a long-running process. The installer, smoke run, pipeline commands, and full tests are included so the implementation can be reproduced and extended on the actual training hardware.
+
+
+## Bonus embedding-only results
+
+128 GSM8K prompts: **6.292 acceptance including bonus**, **50.170 tokens/s**, versus **12.379 tokens/s** for Qwen3-4B (**4.05x throughput**). Output agreement was not checked.
+
+[Full results and inference structure](four_anchor/results/gsm8k_only_embedding.md)

@@ -2,24 +2,21 @@
 
 The target, its paged KV cache, scheduler and greedy rejection sampler are vLLM.
 The shared two-pass drafter uses the checkpoint's PyTorch DFlash equations.
-This first adapter deliberately supports eager, synchronous, single-request,
+This adapter supports eager, synchronous, single-request,
 single-NPU Qwen3 inference. It does not masquerade as vanilla one-anchor DFlash.
 """
 import json
 
 import torch
-from vllm.config import CUDAGraphMode
 from vllm.v1.worker.workspace import init_workspace_manager
-from vllm_ascend.ascend_forward_context import set_ascend_forward_context
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.worker import NPUWorker
 
+from .inference import KnownBonusDraft
 from .model import FourAnchorDFlash
 from .remote_teacher import FrozenTargetInterface
 from .vllm_support import (
-    FeatureHistory, ServingSettings, fixed_window_proposal, retained_forward_tokens,
+    FeatureHistory, ServingSettings, retained_forward_tokens,
 )
 
 
@@ -54,11 +51,17 @@ class FourAnchorProposer:
             len(self.layer_ids) * self.model.hidden_size,
             self.device, target.get_input_embeddings().weight.dtype,
         )
+        self.inference = KnownBonusDraft(
+            self.model, self.history.ids.shape[1], self.settings.num_proposals,
+            profile_steps=self.settings.profile_steps, draft_graph=self.settings.draft_graph)
         print(json.dumps({"event": "four_anchor_vllm_loaded",
+                          "inference_version": "known_bonus_cached_v1",
+                          "known_bonus_slots": 1, "extra_target_forwards": 0,
+                          "context_projection_cache": True, "draft_graph": self.settings.draft_graph,
                           "trained_proposals": self.metadata["draft_config"]["num_proposals"],
                           "serving_proposals": self.settings.num_proposals,
                           "conditioning_anchors": 4,
-                          "query_positions": 4 + self.settings.num_proposals,
+                          "query_positions": 4 + 1 + self.settings.num_proposals,
                           "maximum_committed_per_verification": self.settings.num_proposals + 1,
                           "target_backend": "vllm-ascend",
                           "draft_backend": "pytorch-sdpa", "mode": self.settings.mode}), flush=True)
@@ -67,13 +70,21 @@ class FourAnchorProposer:
     def dummy_run(self, **_kwargs):
         # Include the drafter's maximum-context activation peak in vLLM's
         # memory profiling; weights and persistent history are already loaded.
-        n = self.history.ids.shape[1] - 2 * self.settings.num_proposals
+        n = self.history.ids.shape[1] - 2 * self.settings.num_proposals - 1
         if n < 4:
             raise ValueError("max_model_len is too small for the requested proposal count")
         self.history.ids[:, :n].zero_()
         self.history.features[:, :n].zero_()
-        fixed_window_proposal(self.model, self.history.ids[:, :n],
-                              self.history.features[:, :n], self.settings.mode)
+        profiler = self.inference.profiler
+        limit, profiler.limit = profiler.limit, 0
+        try:
+            self.inference.cache.update("profile", 0, self.history.features[:, :n])
+            if self.inference.graphs is not None:
+                self.inference.graphs.prepare(self.settings.mode)
+            self.inference.propose(self.history.ids[:, :n], self.history.ids[:, :1], self.settings.mode)
+        finally:
+            profiler.limit = limit
+            self.inference.cache.request_id, self.inference.cache.length = None, 0
 
     def propose(self, *args, **kwargs):
         raise RuntimeError("Use four_anchor.vllm_ascend.FourAnchorWorker, not a stock worker")
@@ -109,53 +120,6 @@ class FourAnchorNPUModelRunner(NPUModelRunner):
         return tuple(i + 1 for i in self.drafter.layer_ids)
 
     @torch.inference_mode()
-    def _materialize_bonus(self, token, position, common):
-        """Run ONE target token in its allocated paged-cache slot.
-
-        The scheduler processes this token again in its next normal forward.
-        That deterministic overwrite is intentional; scheduler counters are not
-        advanced behind its back. Rejected slots are excluded by seq_lens.
-        """
-        if len(self.attn_groups) != 1:
-            raise ValueError("Only a single Qwen3 KV cache group is supported")
-        table = self.input_batch.block_table[0]
-        if position >= int(table.num_blocks_per_row[0]) * table.block_size:
-            # custom_class does not allocate extra lookahead KV blocks. At a
-            # page boundary, let the scheduler take one ordinary AR step.
-            return None
-        positions = torch.tensor([position], device=self.device, dtype=torch.long)
-        ids = torch.tensor([token], device=self.device, dtype=torch.long)
-        slot = (common.block_table_tensor[0, position // table.block_size].long()
-                * table.block_size + position % table.block_size).reshape(1)
-        q_cpu = torch.tensor([0, 1], dtype=torch.int32)
-        lengths_cpu = torch.tensor([position + 1], dtype=torch.int32)
-        cm = AscendCommonAttentionMetadata(
-            query_start_loc=q_cpu.to(self.device), query_start_loc_cpu=q_cpu,
-            seq_lens=lengths_cpu.to(self.device), _seq_lens_cpu=lengths_cpu,
-            seq_lens_cpu=lengths_cpu, seq_lens_cpu_upper_bound=lengths_cpu,
-            num_computed_tokens_cpu=torch.tensor([position], dtype=torch.int32),
-            num_reqs=1, num_actual_tokens=1, max_query_len=1,
-            max_seq_len=position + 1, block_table_tensor=common.block_table_tensor[:1],
-            slot_mapping=slot, causal=True, is_prefilling=torch.tensor([False]),
-            num_input_tokens=1, actual_seq_lengths_q=[1], positions=positions,
-            attn_state=AscendAttentionState.DecodeOnly, decode_token_per_req=1,
-        )
-        metadata = {}
-        for group in self.attn_groups[0]:
-            builder = group.get_metadata_builder(0)
-            built = builder.build(common_prefix_len=0, common_attn_metadata=cm)
-            for name in group.layer_names:
-                metadata[name] = built
-        with set_ascend_forward_context(
-            metadata, self.vllm_config, num_tokens=1, num_actual_tokens=1,
-            aclgraph_runtime_mode=CUDAGraphMode.NONE, model_instance=self.model,
-        ):
-            _, aux = self.model(input_ids=ids, positions=positions)
-        if len(aux) != len(self.drafter.layer_ids):
-            raise RuntimeError("Bonus forward returned the wrong auxiliary layers")
-        return ids, torch.cat(aux, dim=-1)
-
-    @torch.inference_mode()
     def propose_draft_token_ids(
         self, valid_sampled_token_ids, sampling_metadata, scheduler_output,
         spec_decode_metadata, spec_decode_common_attn_metadata, positions,
@@ -174,34 +138,37 @@ class FourAnchorNPUModelRunner(NPUModelRunner):
             raise RuntimeError("Target auxiliary hidden states were not captured")
         num_draft = 0 if spec_decode_metadata is None else int(spec_decode_metadata.num_draft_tokens[0])
         keep = retained_forward_tokens(num_scheduled_tokens, num_draft, len(sampled))
-        # One batched D2H read for absolute positions; no per-token .item loop.
-        current_positions = self._get_positions(num_scheduled_tokens)[:keep].tolist()
-        start = current_positions[0]
-        if current_positions != list(range(start, start + keep)):
-            raise RuntimeError("Target inputs are not a contiguous single-request prefix")
+        common = spec_decode_common_attn_metadata
+        computed = getattr(common, "num_computed_tokens_cpu", None)
+        if computed is not None and computed.device.type == "cpu":
+            start = int(computed[0])
+        else:
+            # Compatibility fallback: one scalar transfer, not every position.
+            start = int(self._get_positions(num_scheduled_tokens)[0].item())
         request_id = self.input_batch.req_ids[0]
-        history = self.drafter.history
-        history.update(request_id, start, self.input_ids.gpu[:keep],
-                       torch.cat([h[:keep] for h in aux_hidden_states], dim=-1))
-        if num_draft:
+        history, inference = self.drafter.history, self.drafter.inference
+        with inference.profiler.region("context_cache_update"):
+            accepted_features = torch.cat([h[:keep] for h in aux_hidden_states], dim=-1)
+            history.update(request_id, start, self.input_ids.gpu[:keep], accepted_features)
+            inference.cache.update(request_id, start, accepted_features[None])
+        if num_draft and self.drafter.settings.trace_steps:
             print(json.dumps({"event": "four_anchor_verification", "request_id": request_id,
                               "proposed": num_draft, "accepted_draft": len(sampled) - 1,
                               "committed_before_stop_truncation": len(sampled)}), flush=True)
         n, m = history.length, self.drafter.settings.num_proposals
-        # Leave room for the second pass's M query positions, even though only
-        # its within-window suffix is ultimately proposed to the verifier.
-        if n + 2 * m >= self.max_model_len:
+        if n + 2 * m + 1 > self.max_model_len:
+            inference.profiler.finish()
             return [[]]
-        materialized = self._materialize_bonus(sampled[-1], n, spec_decode_common_attn_metadata)
-        if materialized is None:
-            return [[]]
-        bonus_ids, bonus_features = materialized
-        history.update(request_id, n, bonus_ids, bonus_features)
-        ids, features = history.prefix()
-        tokens, _boundary = fixed_window_proposal(
-            self.drafter.model, ids, features, self.drafter.settings.mode,
-        )
-        return tokens.tolist()
+        # The correction/bonus stays pending in the normal vLLM scheduler. It
+        # enters the drafter by token embedding only, and is processed exactly
+        # once by the next regular target forward alongside the M proposals.
+        bonus = torch.tensor([[sampled[-1]]], device=self.device, dtype=torch.long)
+        tokens, _boundary = inference.propose(history.ids[:, :n], bonus, self.drafter.settings.mode)
+        with inference.profiler.region("proposal_to_host"):
+            result = tokens.tolist()  # required by the pinned custom-class ABI
+        inference.profiler.finish()
+        return result
+
 
 
 class FourAnchorWorker(NPUWorker):

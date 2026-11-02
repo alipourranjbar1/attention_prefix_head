@@ -14,14 +14,17 @@ def engine_options(args):
     options = dict(
         model=args.target, dtype="bfloat16", tensor_parallel_size=1,
         enforce_eager=True, max_model_len=args.max_model_len,
-        max_num_batched_tokens=args.max_model_len, max_num_seqs=1,
+        max_num_batched_tokens=args.max_model_len, max_num_seqs=1, block_size=128,
         enable_prefix_caching=False, enable_chunked_prefill=False,
         async_scheduling=False, gpu_memory_utilization=args.memory_fraction,
         seed=42, trust_remote_code=False,
-        per_request_spec_decode_metrics="detailed", generation_config="vllm",
+        per_request_spec_decode_metrics=("none" if args.mode == "ar" else "detailed"), generation_config="vllm",
     )
     if args.mode != "ar":
-        settings = ServingSettings(str(Path(args.checkpoint).resolve()), args.proposals, args.mode)
+        settings = ServingSettings(str(Path(args.checkpoint).resolve()), args.proposals, args.mode,
+                                   trace_steps=getattr(args, "trace_steps", False),
+                                   profile_steps=getattr(args, "profile_steps", 0),
+                                   draft_graph=getattr(args, "draft_graph", False))
         settings.metadata()
         options.update(
             worker_cls="four_anchor.vllm_ascend.FourAnchorWorker",
@@ -119,7 +122,9 @@ def evaluate(args, options):
             rows.append(row)
             print(json.dumps({k: v for k, v in row.items() if k not in {"prompt_token_ids", "token_ids"}}), flush=True)
     summary = summarize(rows)
-    summary.update(mode=args.mode, conditioning_anchors=4 if args.mode != "ar" else 0,
+    summary.update(draft_graph=getattr(args, "draft_graph", False) and args.mode != "ar", inference_version="known_bonus_cached_v1", extra_target_forwards=0,
+                   profiling_enabled=getattr(args, "profile_steps", 0) > 0,
+                   mode=args.mode, conditioning_anchors=4 if args.mode != "ar" else 0,
                    speculative_tokens=args.proposals if args.mode != "ar" else 0,
                    parity_checked=baseline is not None)
     if baseline is not None:
@@ -152,13 +157,16 @@ def main(argv=None):
     parser.add_argument("--limit", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--draft-graph", action="store_true")
+    parser.add_argument("--trace-steps", action="store_true")
+    parser.add_argument("--profile-steps", type=int, default=0)
     args = parser.parse_args(argv)
     if args.mode != "ar" and not args.checkpoint:
         parser.error("Speculative serving/evaluation requires --checkpoint")
     if args.command == "evaluate" and (not args.data or not args.output):
         parser.error("evaluate requires --data and --output")
-    if args.limit < 1 or args.max_new_tokens < 1 or args.warmup < 0:
-        parser.error("limit/max-new-tokens must be positive; warmup must be nonnegative")
+    if args.limit < 1 or args.max_new_tokens < 1 or args.warmup < 0 or args.profile_steps < 0:
+        parser.error("limit/max-new-tokens must be positive; warmup/profile-steps must be nonnegative")
     options = engine_options(args)
     if args.command == "check":
         print(json.dumps(options, indent=2))

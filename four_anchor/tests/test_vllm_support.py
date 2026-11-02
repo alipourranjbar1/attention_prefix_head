@@ -84,7 +84,7 @@ def test_trained_checkpoint_remains_sixteen_when_serving_fifteen(components, tmp
     config_path = tmp_path / "four_anchor_config.json"
     before = config_path.read_bytes()
     ServingSettings(str(tmp_path), num_proposals=15).apply(drafter)
-    assert drafter.cfg.num_proposals == 15
+    assert drafter.cfg.num_proposals == 16
     assert config_path.read_bytes() == before
     assert json.loads(before)["draft_config"]["num_proposals"] == 16
     with pytest.raises(ValueError, match="exceed"):

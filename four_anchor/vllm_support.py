@@ -1,5 +1,5 @@
 """Checkpoint and fixed-window contracts shared by the vLLM adapter and tests."""
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 import json
 
@@ -13,8 +13,13 @@ class ServingSettings:
     checkpoint: str
     num_proposals: int = 15
     mode: str = "two_pass"
+    trace_steps: bool = False
+    profile_steps: int = 0
+    draft_graph: bool = False
 
     def __post_init__(self):
+        if self.profile_steps < 0:
+            raise ValueError("profile_steps must be nonnegative")
         if self.num_proposals < 1:
             raise ValueError("num_proposals must be positive")
         if self.mode not in {"two_pass", "one_pass"}:
@@ -28,16 +33,16 @@ class ServingSettings:
         cfg = metadata["draft_config"]
         if cfg["num_anchors"] != 4:
             raise ValueError("This adapter requires four conditioning anchors")
-        if self.num_proposals > cfg["num_proposals"]:
-            raise ValueError("Serving cannot exceed the trained proposal count")
+        if self.num_proposals + 1 > cfg["num_proposals"]:
+            raise ValueError("Serving proposals plus the known bonus cannot exceed the trained slot count")
         if not (path / "model.safetensors").is_file():
             raise ValueError("Checkpoint model.safetensors is missing")
         return metadata
 
     def apply(self, drafter):
-        # Override a COPY in memory. Never rewrite the trained checkpoint.
+        # Preserve the checkpoint's trained slot count. Inference uses M+1
+        # slots, fixing slot zero to the known bonus on the first pass.
         self.metadata()
-        drafter.cfg = replace(drafter.cfg, num_proposals=self.num_proposals)
 
 
 def retained_forward_tokens(query_tokens, draft_tokens, sampled_tokens):
@@ -45,7 +50,7 @@ def retained_forward_tokens(query_tokens, draft_tokens, sampled_tokens):
 
     vLLM processes the previous bonus followed by draft candidates. Its output
     contains accepted candidates and ONE new correction/bonus. That NEW bonus
-    is not among the inputs and must be processed separately for its features.
+    is not among the inputs. Drafting uses its embedding, not target features.
     """
     if sampled_tokens < 1 or draft_tokens < 0 or query_tokens <= draft_tokens:
         raise ValueError("Invalid target verification layout")

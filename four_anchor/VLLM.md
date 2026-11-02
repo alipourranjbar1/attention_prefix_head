@@ -1,90 +1,160 @@
-# Four-anchor inference with vLLM on Ascend
+# Four-anchor vLLM inference: known bonus and cached context
 
-The target transformer, paged target KV cache, scheduling and greedy verification run in **vLLM-Ascend**. The trained four-anchor drafter runs inside the same worker using its PyTorch/SDPA equations. There is no Transformers target model and no hidden-state HTTP/file transfer in this inference path. The frozen target embedding/head are loaded separately for the drafter, which costs additional memory.
+This version reuses the trained checkpoint and removes the additional target
+forward from the old adapter. Target execution, target paged KV, scheduling,
+and greedy rejection sampling run in vLLM-Ascend. The drafter runs inside the
+same worker with cached context projections and PyTorch SDPA.
 
-This is an initial, eager, synchronous **single-request / single-NPU** integration for the pinned repository revisions. CPU tests cover the proposal window, anchors, rollback, bonus positions and adapter orchestration. **No actual Ascend execution or speedup is claimed yet.** It is not a fused/paged vLLM draft-model implementation; context projections are recomputed on each draft pass.
+## Exact token layout
 
-## Token counts
+For eight accepted draft tokens followed by the target correction/bonus at
+position nine, the next first pass uses:
 
-| Quantity | Count |
-| --- | ---: |
-| Existing checkpoint training anchors | 4 |
-| Existing checkpoint trained proposal slots | 16 |
-| New vLLM inference conditioning anchors | 4 |
-| New vLLM inference speculative slots | 15 |
-| Drafter query positions in each pass | 19 |
-| Final candidates sent to the verifier | 15 |
-| Maximum draft-only acceptance | 15 |
-| Maximum acceptance including one target correction/bonus | 16 |
+| Input | Contents |
+| --- | --- |
+| Four past anchors | Tokens 5, 6, 7, 8 and their existing target features |
+| Known bonus slot | Token 9's embedding, with no fabricated target features |
+| Fifteen mask slots | Predict tokens 10 through 24 |
 
-The serving override changes the in-memory query shape; it does not rewrite the trained checkpoint or mean that it was trained with 15 slots. Its quality at 15 slots needs measurement. Four anchors are existing context tokens, never four bonus tokens.
+There are **20 query positions**, matching the trained width of four anchors
+plus sixteen slots. The first of those sixteen slots is now fixed to a known
+token; this input pattern differs from the original all-mask training and its
+acceptance must be measured. No checkpoint file or training setting is changed.
 
-Both passes use the **same weights**. Pass one generates 15 candidates. The existing confidence selector chooses a predicted first-error boundary `k` in `[0,14]`. Pass two uses the four positions immediately preceding the restart, with real target features for confirmed positions and first-pass draft features for retained proposals. Its first `15-k` predictions replace the suffix. The verified sequence is `first[:k] + second[:15-k]`, exactly 15 positions. Unlike the old Transformers two-pass runtime, this does not extend the proposal window.
+The shared drafter runs twice. Confidence scores select a boundary `k` from the
+15 future-token predictions, excluding the known bonus. Pass two uses the four
+positions immediately before `n + 1 + k`. Positions before `n` use target
+features; positions at/after `n` use first-pass draft features, including the
+known bonus's first-pass draft state where applicable. Pass two keeps the same
+20-position shape (four anchors plus sixteen masks); only its first `15-k`
+predictions replace the suffix. The final proposal is exactly 15 tokens.
 
 ```mermaid
 flowchart TD
-    A["Confirmed prefix and target features"] --> B["Four anchors + 15 masks"]
-    B --> C["Pass one and confidence boundary k"]
-    C --> D["Pass two from four preceding positions"]
-    D --> E["Retain k + replace 15-k candidates"]
-    E --> F["vLLM verifies 15 candidates"]
-    F --> G["Accept prefix + one correction or bonus"]
-    G --> H["Materialize bonus hidden state"]
+    A["Target verification"] --> B["Keep accepted inputs and target states"]
+    A --> C["New correction/bonus ID"]
+    B --> D["Update confirmed context K/V cache"]
+    D --> E["4 past anchors + bonus + 15 masks"]
+    C --> E
+    E --> F["First draft and boundary k"]
+    F --> G["Redraft suffix from 4 preceding anchors"]
+    G --> H["Exactly 15 candidates"]
     H --> A
 ```
 
-The bonus must be processed to obtain its actual hidden state. The adapter runs an additional one-token vLLM target forward, using the accepted-prefix KV length. The scheduler later processes that token normally again; the adapter does not advance scheduler counters privately. Rejected KV positions are excluded from attention, and rejected features are discarded. If no KV page is allocated for the bonus position, drafting is skipped for that iteration and normal target decoding advances the sequence. This adds work and must be included in throughput measurements.
+The bonus remains pending in the ordinary vLLM scheduler. The next target call
+processes **the pending bonus + 15 candidates together**. There is no separate
+bonus-materialization target call and no write to an unallocated target KV page.
+Rejected target states never enter persistent draft memory. On a new request the
+cache is reset; on rollback its valid length is truncated. Near the maximum
+context length, the adapter stops proposing and vLLM finishes autoregressively.
 
-## Evaluate the first checkpoint
+The maximum draft acceptance is **15**, and including one target correction/bonus
+it is **16**. The four anchors and the pending bonus input are not additional
+accepted proposals. Native metrics count before EOS/output-budget trimming.
 
-Run inside the existing `attention_prefix_ali` environment, using an available NPU. The script uses the existing local GSM8K prompts and disables Hub access. It neither starts training nor kills existing processes.
+## Optimizations included
+
+- Project only newly confirmed target context. Cache each layer's context K/V
+  and share it across both passes and subsequent verification cycles.
+- Vectorized anchor construction, on-device confidence boundary and suffix
+  selection. No `.item()` or `.tolist()` between the two draft passes.
+- Precomputed rotary tables and persistent context buffers. Only the pinned
+  custom-proposer API's final candidate-list transfer remains necessary.
+- No vocabulary projection for the already-known bonus token.
+- Per-cycle JSON tracing is off by default; pooled acceptance metrics remain.
+- Optional bucketed drafter ACLGraph replay. Target execution remains eager.
+- KV-cache block size explicitly 128 for the pinned Ascend attention backend.
+
+Concurrency is **one**, with TP=PP=DP=1 and greedy sampling. Prefix caching,
+chunked prefill, async scheduling, quantization and LoRA are disabled. These are
+implementation limits, not training requirements.
+
+## Install into the existing pipeline
+
+Extract the latest `fix.zip` and run `four-anchor-dflash/install_vllm.sh ROOT`.
+It backs up modified files, installs only inference files, and includes the
+bias-free RMSNorm fallback already validated on the user's CANN 9.1 environment.
+It preserves the existing training source, saved checkpoints and other edits.
+It does not install packages, reset submodules, commit or push.
+
+`VLLM_SOURCE_ROOT` now defaults to the pipeline root, whose initialized submodules
+must match vLLM `77b1d88c5b52abaf6a103292119f3435b51699d9` and vLLM-Ascend
+`276a5c840b21c83b153d3ebd831720bc926dfc4e`.
+
+## Run the first checkpoint on NPU 7
 
 ```bash
 conda activate attention_prefix_ali
 ROOT=/home/n84449292/a84384644/attention_head_forked/four-anchor-dflash-pipeline
-
-# Default: checkpoint-016699, physical NPU 7, 128 local prompts, 2048 output tokens.
-EVAL_NPU=7 LIMIT=4 MAX_NEW_TOKENS=128 \
+EVAL_NPU=7 LIMIT=128 MAX_NEW_TOKENS=2048 \
   bash "$ROOT/four_anchor/scripts/vllm_ascend.sh" evaluate
 ```
 
-Begin with the four-prompt hardware smoke run above. A successful run must show `four_anchor_vllm_loaded`, `target_backend: vllm-ascend`, `serving_proposals: 15`, and nonzero native speculative metrics. Then compare with plain vLLM Qwen3 on identical prompts:
+Defaults use `checkpoint-016699` from
+`output/four_anchor_dflash_20261031_025300_2111006`, and the 128 local GSM8K prompts
+in that run's `evaluation/epoch1_gsm8k_20261102_230727/prompts.jsonl`.
+Override `DRAFT`, `MODEL`, `DATA`, `RUN`, or `OUTPUT_DIR` explicitly when needed.
+A fresh output directory is required for each evaluation.
+
+The startup event must show `inference_version: known_bonus_cached_v1`,
+`conditioning_anchors: 4`, `known_bonus_slots: 1`, `query_positions: 20`,
+`serving_proposals: 15`, and `extra_target_forwards: 0`.
+
+## Compare with ordinary Qwen3-4B
 
 ```bash
-RUN="$ROOT/output/four_anchor_dflash_20261031_025300_2111006"
-EVAL_ROOT="$RUN/evaluation/vllm_comparison_$(date +%Y%m%d_%H%M%S)"
-
-# Run sequentially on the same NPU for the cleanest speed comparison.
-MODE=ar EVAL_NPU=7 OUTPUT_DIR="$EVAL_ROOT/ar" \
-  bash "$ROOT/four_anchor/scripts/vllm_ascend.sh" evaluate
-
-MODE=two_pass EVAL_NPU=7 OUTPUT_DIR="$EVAL_ROOT/two_pass" \
-  BASELINE="$EVAL_ROOT/ar/per_prompt.jsonl" \
-  bash "$ROOT/four_anchor/scripts/vllm_ascend.sh" evaluate
+EVAL_NPU=7 LIMIT=128 MAX_NEW_TOKENS=2048 \
+  bash "$ROOT/four_anchor/scripts/compare_vllm.sh"
 ```
 
-`summary.json` reports pooled throughput (total emitted tokens / total timed seconds), native draft-only acceptance, acceptance including one bonus, and exact output-token agreement when `BASELINE` is supplied. Model loading and warmup are excluded; prefill and all worker drafting/materialization are included. Native acceptance counts verification before EOS or output-budget truncation, so it is not necessarily emitted tokens divided by cycles. Failed output agreement makes the benchmark exit with an error after writing the results. This evaluates decoding correctness and speed; it does not score GSM8K answer accuracy.
+This runs ordinary Qwen3 and two-pass speculation sequentially on the same NPU,
+with identical prompts and budgets. It checks token-for-token greedy agreement,
+reports acceptance and speedup, and saves `comparison.json`. Set
+`COMPARE_ONE_PASS=1` to include the one-pass ablation. The baseline uses the same
+eager target setting; this is not a comparison against a graph-optimized AR
+baseline. A parity failure retains results but exits nonzero and makes the
+speedup provisional. BF16 shape-dependent differences need investigation.
+This benchmark measures generation, not GSM8K mathematical-answer accuracy.
 
-`MODE=one_pass` is an ablation using the same four-anchor checkpoint and 15 candidates. `MODE=ar EVAL_NPU=1` selects plain Qwen3 on the second physical card. Concurrent runs can contend for host resources, so use sequential runs for final speed claims.
+## Optional drafter graph mode
 
-## Start a vLLM API server
+`DRAFT_GRAPH=0` is the default. To test the experimental graph path first:
 
 ```bash
-EVAL_NPU=7 PORT=8095 \
-  bash "$ROOT/four_anchor/scripts/vllm_ascend.sh" serve
+DRAFT_GRAPH=1 EVAL_NPU=7 LIMIT=4 MAX_NEW_TOKENS=128 \
+  bash "$ROOT/four_anchor/scripts/compare_vllm.sh"
 ```
 
-Use `http://127.0.0.1:8095/v1`, model `four-anchor-qwen3`, and **temperature 0**. The server uses vLLM's standard OpenAI API. Sampling at other temperatures is rejected by the worker in this initial adapter. Concurrency is serialized with `max_num_seqs=1`.
+The drafter's two-pass body is captured in context buckets up to `MAX_MODEL_LEN`.
+Length, bonus ID, token history and cached context tensors are updated on every
+replay. Padded context keys are masked. Capture happens during memory profiling,
+so persistent graph allocations are included before vLLM reserves its target KV
+cache. The target transformer remains eager; this does not enable native vLLM
+target graphs. Graph capture/replay requires validation on the actual NPU/CANN
+stack. If it fails, `DRAFT_GRAPH=0` still provides cached drafting with no extra
+target call. No automatic silent fallback is used for graph failures.
 
-## Paths and compatibility
+## Profile and diagnose
 
-Defaults:
+```bash
+PROFILE_STEPS=12 EVAL_NPU=7 LIMIT=4 MAX_NEW_TOKENS=128 \
+  bash "$ROOT/four_anchor/scripts/vllm_ascend.sh" evaluate
+```
 
-- `DRAFT=$RUN/checkpoints/checkpoint-016699`.
-- `DATA=$RUN/evaluation/epoch1_gsm8k_20261102_230727/prompts.jsonl`.
-- `NUM_SPECULATIVE_TOKENS=15`, `MAX_MODEL_LEN=4096`, `MEMORY_FRACTION=0.8`.
-- `VLLM_SOURCE_ROOT=/home/n84449292/a84384644/attention_head_forked/attention_prefix_head`.
+Synchronized `four_anchor_profile` entries measure context-cache updates,
+first pass, boundary work, second pass, and final transfer to the host. Graph mode
+reports the combined graph-replay region instead of individual passes. These
+are drafter-region timings, not target-forward timings. Profiling changes
+execution overhead, so leave `PROFILE_STEPS=0` for throughput measurement.
+`TRACE_STEPS=1` restores verbose per-verification JSON for debugging.
 
-The source check requires vLLM `77b1d88c5b52abaf6a103292119f3435b51699d9` and vLLM-Ascend `276a5c840b21c83b153d3ebd831720bc926dfc4e`, the commits pinned by this branch. It does not change your existing source checkout. The current implementation requires v1, TP=PP=DP=1, unquantized dense Qwen3, no LoRA/KV transfer, no prefix caching, no chunked prefill, and no graph capture. Those restrictions ensure the complete target-feature history is available and that the extra bonus forward uses the supported metadata layout.
+## Validation scope
 
-`check` prints the resolved engine configuration without loading a target or starting a server. It is a configuration check, not an NPU kernel test. The old `python -m four_anchor.cli evaluate/serve` commands remain the Transformers reference; use the new script for vLLM.
+CPU tests compare cached and uncached full-context equations, all 15 boundaries,
+short prompts, cache append/rollback/reset, graph padding and replay-input
+refresh, adapter exclusion of rejected features, and exact greedy decoding
+with one target call per verification. The complete pipeline regression suite
+is included. Actual Ascend execution, graph replay and speedup for this new
+version are not claimed by these CPU tests. Training files and checkpoint bytes
+are unchanged.
