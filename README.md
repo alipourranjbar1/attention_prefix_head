@@ -1,3 +1,7 @@
+## vLLM four-anchor inference update
+
+See [the vLLM guide](four_anchor/VLLM.md): four conditioning anchors, 15 speculative candidates, and acceptance including one bonus capped at 16. The target and verification run in vLLM; the drafter uses PyTorch SDPA inside the worker. CPU logic checks pass; Ascend execution requires hardware validation.
+
 # Four-anchor DFlash pipeline
 
 Branch: **`four-anchor-dflash-pipeline`**. This root README is the branch landing page on GitHub.
