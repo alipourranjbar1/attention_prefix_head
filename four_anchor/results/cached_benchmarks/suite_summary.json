@@ -1,0 +1,356 @@
+{
+  "inference_version": "known_bonus_cached_v1",
+  "concurrency": 1,
+  "note": "Acceptance before EOS/budget truncation; throughput includes prefill, excludes loading/warmup. Accuracy not measured.",
+  "benchmarks": {
+    "gsm8k": {
+      "status": "completed",
+      "prompts": 128,
+      "available_rows": 1319,
+      "source": {
+        "kind": "frozen_prompt_manifest",
+        "path": "/home/n84449292/a84384644/attention_head_forked/attention_prefix_head/Evaluator/retrace_eval_prompts.json",
+        "sha256": "560bb034bb5faeb5bbbb1444b1336abd54435bb6262d47f0a61b29f3abc66055",
+        "source": {
+          "repo": "openai/gsm8k",
+          "config": "main",
+          "split": "test",
+          "fingerprint": "59ec1b7f9357c7a2"
+        },
+        "source_rows": 1319,
+        "manifest_rows": 1319,
+        "selection": "existing frozen order"
+      },
+      "data": "/home/n84449292/a84384644/attention_head_forked/four-anchor-dflash-pipeline/output/four_anchor_dflash_20261031_025300_2111006/evaluation/cached_suite_20261103_115831_3028663/gsm8k/prompts.jsonl",
+      "prompt_file_sha256": "9f017d838e4dbc7cc1959ca5b6cedadba40e5c6b5388136b264fa21b49211e5e",
+      "max_prompt_tokens": 155,
+      "max_model_len": 4096,
+      "diagnostics": [],
+      "summary": {
+        "prompts": 128,
+        "output_tokens": 38007,
+        "seconds": 754.7030197526328,
+        "tokens_per_second_including_prefill": 50.36020660478802,
+        "verification_cycles": 6020,
+        "accepted_draft_per_verification": 5.2921926910299,
+        "acceptance_length_including_bonus": 6.2921926910299,
+        "acceptance_note": "vLLM verification accounting, before EOS/output-budget truncation; anchors excluded",
+        "draft_graph": false,
+        "inference_version": "known_bonus_cached_v1",
+        "extra_target_forwards": 0,
+        "profiling_enabled": false,
+        "mode": "two_pass",
+        "conditioning_anchors": 4,
+        "speculative_tokens": 15,
+        "parity_checked": false
+      }
+    },
+    "math500": {
+      "status": "completed",
+      "prompts": 128,
+      "available_rows": 500,
+      "source": {
+        "kind": "frozen_prompt_manifest",
+        "path": "/home/n84449292/a84384644/attention_head_forked/attention_prefix_head/Evaluator/retrace_eval_prompts.json",
+        "sha256": "560bb034bb5faeb5bbbb1444b1336abd54435bb6262d47f0a61b29f3abc66055",
+        "source": {
+          "repo": "HuggingFaceH4/MATH-500",
+          "config": "default",
+          "split": "test",
+          "fingerprint": "f3124375297911ba"
+        },
+        "source_rows": 500,
+        "manifest_rows": 500,
+        "selection": "existing frozen order"
+      },
+      "data": "/home/n84449292/a84384644/attention_head_forked/four-anchor-dflash-pipeline/output/four_anchor_dflash_20261031_025300_2111006/evaluation/cached_suite_20261103_115831_3028663/math500/prompts.jsonl",
+      "prompt_file_sha256": "bf44bab780087dadd9f84575f4f42761d8d7a0ae4101344ee40f2f9dafc77edf",
+      "max_prompt_tokens": 375,
+      "max_model_len": 4096,
+      "diagnostics": [],
+      "summary": {
+        "prompts": 128,
+        "output_tokens": 92190,
+        "seconds": 1892.1638743020594,
+        "tokens_per_second_including_prefill": 48.72199562207848,
+        "verification_cycles": 14909,
+        "accepted_draft_per_verification": 5.179824267221141,
+        "acceptance_length_including_bonus": 6.179824267221141,
+        "acceptance_note": "vLLM verification accounting, before EOS/output-budget truncation; anchors excluded",
+        "draft_graph": false,
+        "inference_version": "known_bonus_cached_v1",
+        "extra_target_forwards": 0,
+        "profiling_enabled": false,
+        "mode": "two_pass",
+        "conditioning_anchors": 4,
+        "speculative_tokens": 15,
+        "parity_checked": false
+      }
+    },
+    "humaneval": {
+      "status": "completed",
+      "prompts": 128,
+      "available_rows": 164,
+      "source": {
+        "kind": "frozen_prompt_manifest",
+        "path": "/home/n84449292/a84384644/attention_head_forked/attention_prefix_head/Evaluator/retrace_eval_prompts.json",
+        "sha256": "560bb034bb5faeb5bbbb1444b1336abd54435bb6262d47f0a61b29f3abc66055",
+        "source": {
+          "repo": "openai/openai_humaneval",
+          "config": "openai_humaneval",
+          "split": "test",
+          "fingerprint": "2e5aa734ef24e324"
+        },
+        "source_rows": 164,
+        "manifest_rows": 164,
+        "selection": "existing frozen order"
+      },
+      "data": "/home/n84449292/a84384644/attention_head_forked/four-anchor-dflash-pipeline/output/four_anchor_dflash_20261031_025300_2111006/evaluation/cached_suite_20261103_115831_3028663/humaneval/prompts.jsonl",
+      "prompt_file_sha256": "c846e7ac04347fc294117559f4e251592369dff5dddc552a81f4858e94dabd35",
+      "max_prompt_tokens": 353,
+      "max_model_len": 4096,
+      "diagnostics": [],
+      "summary": {
+        "prompts": 128,
+        "output_tokens": 55916,
+        "seconds": 1525.8580161826685,
+        "tokens_per_second_including_prefill": 36.64561145727598,
+        "verification_cycles": 12346,
+        "accepted_draft_per_verification": 3.5187105135266483,
+        "acceptance_length_including_bonus": 4.518710513526648,
+        "acceptance_note": "vLLM verification accounting, before EOS/output-budget truncation; anchors excluded",
+        "draft_graph": false,
+        "inference_version": "known_bonus_cached_v1",
+        "extra_target_forwards": 0,
+        "profiling_enabled": false,
+        "mode": "two_pass",
+        "conditioning_anchors": 4,
+        "speculative_tokens": 15,
+        "parity_checked": false
+      }
+    },
+    "mbpp": {
+      "status": "completed",
+      "prompts": 128,
+      "available_rows": 257,
+      "source": {
+        "kind": "frozen_prompt_manifest",
+        "path": "/home/n84449292/a84384644/attention_head_forked/attention_prefix_head/Evaluator/retrace_eval_prompts.json",
+        "sha256": "560bb034bb5faeb5bbbb1444b1336abd54435bb6262d47f0a61b29f3abc66055",
+        "source": {
+          "repo": "google-research-datasets/mbpp",
+          "config": "sanitized",
+          "split": "test",
+          "fingerprint": "2a3e2ac261e947c2"
+        },
+        "source_rows": 257,
+        "manifest_rows": 257,
+        "selection": "existing frozen order"
+      },
+      "data": "/home/n84449292/a84384644/attention_head_forked/four-anchor-dflash-pipeline/output/four_anchor_dflash_20261031_025300_2111006/evaluation/cached_suite_20261103_115831_3028663/mbpp/prompts.jsonl",
+      "prompt_file_sha256": "2d58ab39a253272b2c13c2a1257d4e4f898a2a0e326d7bfec655b14cbcac4a27",
+      "max_prompt_tokens": 61,
+      "max_model_len": 4096,
+      "diagnostics": [],
+      "summary": {
+        "prompts": 128,
+        "output_tokens": 42765,
+        "seconds": 1332.9056957471184,
+        "tokens_per_second_including_prefill": 32.08404025614837,
+        "verification_cycles": 10716,
+        "accepted_draft_per_verification": 2.978816722657708,
+        "acceptance_length_including_bonus": 3.978816722657708,
+        "acceptance_note": "vLLM verification accounting, before EOS/output-budget truncation; anchors excluded",
+        "draft_graph": false,
+        "inference_version": "known_bonus_cached_v1",
+        "extra_target_forwards": 0,
+        "profiling_enabled": false,
+        "mode": "two_pass",
+        "conditioning_anchors": 4,
+        "speculative_tokens": 15,
+        "parity_checked": false
+      }
+    },
+    "lcb": {
+      "status": "completed",
+      "prompts": 128,
+      "available_rows": 880,
+      "source": {
+        "kind": "frozen_prompt_manifest",
+        "path": "/home/n84449292/a84384644/attention_head_forked/attention_prefix_head/Evaluator/retrace_eval_prompts.json",
+        "sha256": "560bb034bb5faeb5bbbb1444b1336abd54435bb6262d47f0a61b29f3abc66055",
+        "source": {
+          "repo": "livecodebench/code_generation_lite",
+          "release": 5,
+          "source_sha256": {
+            "test.jsonl": "2bd02b38beb48e8c46b5b9987095d999ff38cd8efc255ea5d58974317c48f63f",
+            "test2.jsonl": "095df7c5daf15f882c51a9deb84085cff1e073495a5dbcf95015a564d485f3a3",
+            "test3.jsonl": "28ed26cc83363ce3f1fe2d5fad9f8393077beb1907b167a31bd3b32f80801b79",
+            "test4.jsonl": "d711138ddaebfcf5f8ec6a4283ee677298c0f5c5d374a235af92aaf0584510da",
+            "test5.jsonl": "7f77571c2a6df0c2a72a3277650309f67e01e0008e18117e624633df53f81214"
+          }
+        },
+        "source_rows": 880,
+        "manifest_rows": 880,
+        "selection": "existing frozen order"
+      },
+      "data": "/home/n84449292/a84384644/attention_head_forked/four-anchor-dflash-pipeline/output/four_anchor_dflash_20261031_025300_2111006/evaluation/cached_suite_20261103_115831_3028663/lcb/prompts.jsonl",
+      "prompt_file_sha256": "2bb82701177b37ee8b4f64f1bde2ffc532f6bb8c51d1225b39080a2389b87304",
+      "max_prompt_tokens": 854,
+      "max_model_len": 4096,
+      "diagnostics": [],
+      "summary": {
+        "prompts": 128,
+        "output_tokens": 64544,
+        "seconds": 1985.120714389719,
+        "tokens_per_second_including_prefill": 32.513891740756236,
+        "verification_cycles": 15861,
+        "accepted_draft_per_verification": 3.06493915894332,
+        "acceptance_length_including_bonus": 4.06493915894332,
+        "acceptance_note": "vLLM verification accounting, before EOS/output-budget truncation; anchors excluded",
+        "draft_graph": false,
+        "inference_version": "known_bonus_cached_v1",
+        "extra_target_forwards": 0,
+        "profiling_enabled": false,
+        "mode": "two_pass",
+        "conditioning_anchors": 4,
+        "speculative_tokens": 15,
+        "parity_checked": false
+      }
+    },
+    "aime25": {
+      "status": "completed",
+      "prompts": 30,
+      "available_rows": 30,
+      "source": {
+        "kind": "frozen_prompt_manifest",
+        "path": "/home/n84449292/a84384644/attention_head_forked/attention_prefix_head/Evaluator/retrace_eval_prompts_all_v2.json",
+        "sha256": "e4d50ca8e67e50cd2ee478e526210b1c25da07d74a20b7e59724196dde8e3a8f",
+        "source": {
+          "repo": "MathArena/aime_2025",
+          "config": "default",
+          "split": "train",
+          "fingerprint": "50feddde995d81db"
+        },
+        "source_rows": 30,
+        "manifest_rows": 30,
+        "selection": "existing frozen order"
+      },
+      "data": "/home/n84449292/a84384644/attention_head_forked/four-anchor-dflash-pipeline/output/four_anchor_dflash_20261031_025300_2111006/evaluation/cached_suite_20261103_115831_3028663/aime25/prompts.jsonl",
+      "prompt_file_sha256": "cf9d50b35083fca5b7f8b4a0041e8344a3794039bab4cc057960e5e01585a15e",
+      "max_prompt_tokens": 795,
+      "max_model_len": 4096,
+      "diagnostics": [],
+      "summary": {
+        "prompts": 30,
+        "output_tokens": 52391,
+        "seconds": 1315.2915691286325,
+        "tokens_per_second_including_prefill": 39.83223281413452,
+        "verification_cycles": 10181,
+        "accepted_draft_per_verification": 4.1514585993517334,
+        "acceptance_length_including_bonus": 5.1514585993517334,
+        "acceptance_note": "vLLM verification accounting, before EOS/output-budget truncation; anchors excluded",
+        "draft_graph": false,
+        "inference_version": "known_bonus_cached_v1",
+        "extra_target_forwards": 0,
+        "profiling_enabled": false,
+        "mode": "two_pass",
+        "conditioning_anchors": 4,
+        "speculative_tokens": 15,
+        "parity_checked": false
+      }
+    },
+    "mtbench": {
+      "status": "completed",
+      "prompts": 80,
+      "available_rows": 80,
+      "source": {
+        "kind": "frozen_prompt_manifest",
+        "path": "/home/n84449292/a84384644/attention_head_forked/attention_prefix_head/Evaluator/retrace_eval_prompts_all_v2.json",
+        "sha256": "e4d50ca8e67e50cd2ee478e526210b1c25da07d74a20b7e59724196dde8e3a8f",
+        "source": {
+          "repo": "HuggingFaceH4/mt_bench_prompts",
+          "config": "default",
+          "split": "train",
+          "fingerprint": "d12641a72a5060ef"
+        },
+        "source_rows": 80,
+        "manifest_rows": 80,
+        "selection": "existing frozen order"
+      },
+      "data": "/home/n84449292/a84384644/attention_head_forked/four-anchor-dflash-pipeline/output/four_anchor_dflash_20261031_025300_2111006/evaluation/cached_suite_20261103_115831_3028663/mtbench/prompts.jsonl",
+      "prompt_file_sha256": "a9288fb2aac0e3a6989400107d6923469786f0db672c5ea18edf15562cfc4adc",
+      "max_prompt_tokens": 368,
+      "max_model_len": 4096,
+      "diagnostics": [],
+      "summary": {
+        "prompts": 80,
+        "output_tokens": 38666,
+        "seconds": 1892.129034651909,
+        "tokens_per_second_including_prefill": 20.435181370763807,
+        "verification_cycles": 14849,
+        "accepted_draft_per_verification": 1.598962893124116,
+        "acceptance_length_including_bonus": 2.598962893124116,
+        "acceptance_note": "vLLM verification accounting, before EOS/output-budget truncation; anchors excluded",
+        "draft_graph": false,
+        "inference_version": "known_bonus_cached_v1",
+        "extra_target_forwards": 0,
+        "profiling_enabled": false,
+        "mode": "two_pass",
+        "conditioning_anchors": 4,
+        "speculative_tokens": 15,
+        "parity_checked": false
+      }
+    },
+    "alpaca": {
+      "status": "completed",
+      "prompts": 128,
+      "available_rows": 2000,
+      "source": {
+        "kind": "frozen_prompt_manifest",
+        "path": "/home/n84449292/a84384644/attention_head_forked/attention_prefix_head/Evaluator/retrace_eval_prompts.json",
+        "sha256": "560bb034bb5faeb5bbbb1444b1336abd54435bb6262d47f0a61b29f3abc66055",
+        "source": {
+          "repo": "tatsu-lab/alpaca",
+          "config": "default",
+          "split": "train",
+          "fingerprint": "a5048bbbf302198f"
+        },
+        "source_rows": 52002,
+        "manifest_rows": 2000,
+        "selection": "existing frozen order"
+      },
+      "data": "/home/n84449292/a84384644/attention_head_forked/four-anchor-dflash-pipeline/output/four_anchor_dflash_20261031_025300_2111006/evaluation/cached_suite_20261103_115831_3028663/alpaca/prompts.jsonl",
+      "prompt_file_sha256": "1c462b0b48474a3d95647f5e8ac44f7ae71b6904fb126ea5ca86869642cafd04",
+      "max_prompt_tokens": 118,
+      "max_model_len": 4096,
+      "diagnostics": [],
+      "summary": {
+        "prompts": 128,
+        "output_tokens": 51705,
+        "seconds": 2703.50156823406,
+        "tokens_per_second_including_prefill": 19.125196969563422,
+        "verification_cycles": 21751,
+        "accepted_draft_per_verification": 1.3712472989747597,
+        "acceptance_length_including_bonus": 2.37124729897476,
+        "acceptance_note": "vLLM verification accounting, before EOS/output-budget truncation; anchors excluded",
+        "draft_graph": false,
+        "inference_version": "known_bonus_cached_v1",
+        "extra_target_forwards": 0,
+        "profiling_enabled": false,
+        "mode": "two_pass",
+        "conditioning_anchors": 4,
+        "speculative_tokens": 15,
+        "parity_checked": false
+      }
+    }
+  },
+  "overall_completed_only": {
+    "prompts": 878,
+    "output_tokens": 436184,
+    "seconds": 13401.6734923888,
+    "verification_cycles": 106633,
+    "tokens_per_second_including_prefill": 32.54698006541658,
+    "acceptance_length_including_bonus": 4.084373505387638
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "source_commit": "10f0b86636d4ccbe8808745c54898d58d8940a95",
+  "inference_commit": "9a2671f3283015952c73265c6bf3c3741c22a045",
+  "inference_version": "known_bonus_cached_v1",
+  "offline_tests_passed": 28,
+  "ascend_hardware_tested": false,
+  "source_sha256": "959eb407fbfcde4d967d538d2429a1d203a27ba3917e381abc56b4d1642213f8"
+}

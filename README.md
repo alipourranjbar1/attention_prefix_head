@@ -1,18 +1,33 @@
-**Optimized vLLM Ascend inference:** see [four_anchor/VLLM.md](four_anchor/VLLM.md). The first pass uses 4 past anchors + 1 known bonus + 15 masks (20 positions). There is no extra target forward. Context K/V is cached, anchor selection stays on-device, and optional drafter graph replay is available. Verification receives 15 proposals; maximum acceptance with one bonus is 16. CPU tests pass; the new path needs NPU validation and measured speedup.
+# Four-anchor DFlash: cached benchmarks
 
-## vLLM four-anchor inference update
+Branch: **`four-anchor-cached-benchmarks`**.
 
-See [the vLLM guide](four_anchor/VLLM.md): four conditioning anchors, 15 speculative candidates, and acceptance including one bonus capped at 16. The target and verification run in vLLM; the drafter uses PyTorch SDPA inside the worker. CPU logic checks pass; Ascend execution requires hardware validation.
+Recovered embedding-only inference: four past target-state anchors, two drafting passes, fifteen speculative candidates, and one target forward per decoding round.
 
-# Four-anchor DFlash pipeline
+[Benchmark instructions](four_anchor/CACHED_BENCHMARKS.md) · [Inference structure](four_anchor/VLLM.md)
 
-Branch: **`four-anchor-only-embedding`**.
+## Benchmark results
 
-This implements **one shared regular DFlash drafter**, four explicit anchors, and two draft passes. Each pass has **4 anchor slots + 16 masked generation slots = 20 query positions** and predicts **16 new tokens**. It includes data preparation, training and resume, greedy inference, evaluation, HTTP serving, CPU tests, and launch scripts.
+Run: `cached_suite_20261103_115831_3028663`.
 
-The decoder layers are imported directly from `speculators.models.dflash.model_definitions.Qwen3DFlashDecoderLayer` in the repository's pinned submodule. No prefix-attention variant or MTP layer is instantiated. Implementation code lives in `four_anchor/`; existing submodule code and pins are unchanged.
+Acceptance before EOS/budget truncation; throughput includes prefill, excludes loading/warmup. Accuracy not measured.
 
-Source base: `alipourranjbar1/attention_prefix_head`, branch `prefix-attention-qwen3-4b`, root commit `831471c2207fcf41493c73d126ca023ced6cc301`, speculators commit `89b5caa300f473c1e3127497e6f594ba024057d5`.
+| Benchmark | Status | Prompts | Acceptance + bonus | Tokens/s | Speedup vs AR | Exact parity |
+|---|---|---:|---:|---:|---:|---|
+| gsm8k | completed | 128 | 6.292 | 50.360 | — | — |
+| math500 | completed | 128 | 6.180 | 48.722 | — | — |
+| humaneval | completed | 128 | 4.519 | 36.646 | — | — |
+| mbpp | completed | 128 | 3.979 | 32.084 | — | — |
+| lcb | completed | 128 | 4.065 | 32.514 | — | — |
+| aime25 | completed | 30 | 5.151 | 39.832 | — | — |
+| mtbench | completed | 80 | 2.599 | 20.435 | — | — |
+| alpaca | completed | 128 | 2.371 | 19.125 | — | — |
+
+Sources, unavailable caches, preparation errors and per-benchmark summaries: `suite_summary.json`.
+MT-Bench uses first user turns; a frozen manifest may contain only a cached subset.
+No new speedup or parity claim is available unless --with-baseline was used.
+
+[CSV results](four_anchor/results/cached_benchmarks/summary.csv) · [Detailed JSON](four_anchor/results/cached_benchmarks/suite_summary.json) · [Run configuration](four_anchor/results/cached_benchmarks/plan.json)
 
 ## Train on your Ascend setup
 
