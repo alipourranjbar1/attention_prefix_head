@@ -4,6 +4,8 @@ KnownBonusDraft preserves the published 20-position embedding-only inference.
 BonusInFourDraft is the superseded format-2 embedding-only 19-position variant.
 TargetFourDraft is the corrected format-3 layout: four actual target-state
 anchors, including a materialized bonus, plus fifteen masks in both rounds.
+AcceptedPrefixDraft uses the same checkpoint and 19-position queries but starts
+from the processed prefix, avoiding bonus materialization altogether.
 """
 from contextlib import contextmanager
 import json
@@ -317,6 +319,54 @@ rule. The model runner owns bonus materialization and counts that target call.
             index = self.candidate_offsets[None]
             replacement = second.gather(1, (index - boundary[:, None]).clamp_min(0))
             tokens = torch.where(index < boundary[:, None], first, replacement)
+        return tokens, boundary
+
+
+class AcceptedPrefixDraft(TargetFourDraft):
+    """Inference-only policy: four processed anchors, two 15-mask passes.
+
+    The native verifier has already sampled a pending token at position n.
+    It has not processed that token, so h_target[n] does not exist yet.
+    Round one predicts n..n+14 from the four cached anchors ending at n-1.
+    Its slot-zero token ID is then fixed to the known token (its feature stays
+    the first-pass drafter state). Redrafting starts in n+1..n+14 and extends
+    coverage through n+15. Return exactly n+1..n+15 to native vLLM, which
+    schedules [pending token, 15 candidates] in its ONE verification forward.
+
+    No target state is fabricated; neither the pending token nor rejected
+    candidates are inserted into the processed-prefix feature cache.
+    """
+    requires_materialized_bonus = False
+
+    def propose(self, ids, bonus=None, mode="two_pass"):
+        if mode != "two_pass":
+            raise ValueError("accepted_prefix requires two_pass to cover 15 candidates after the bonus")
+        if bonus is None or bonus.shape != (1, 1):
+            raise ValueError("accepted_prefix requires the pending bonus token ID, not its target state")
+        return KnownBonusDraft.propose(self, ids, bonus, mode)
+
+    def tensor_propose(self, ids, bonus, start, mode):
+        if mode != "two_pass":
+            raise ValueError("accepted_prefix requires two_pass")
+        with self.profiler.region("draft_first"):
+            h1 = self.pass_hidden(ids, start, start, self.zero_ids, self.zero_hidden, self.masks)
+            # Slot zero is known; avoid an unused vocabulary projection there.
+            logits = self.model.lm_head(h1[:, 1:])
+            first = torch.cat((bonus.reshape(1, 1), logits.argmax(-1)), dim=1)
+        with self.profiler.region("boundary_and_anchors"):
+            # The known slot is retained even if its masked prediction would
+            # disagree. Boundary selection only considers unknown positions.
+            boundary = boundary_scores(logits).argmax(-1) + 1
+            restart = start + boundary[0]
+        with self.profiler.region("draft_second"):
+            h2 = self.pass_hidden(ids, start, restart, first, h1, self.masks)
+            second = self.model.lm_head(h2).argmax(-1)
+            relative = self.candidate_offsets[None] + 1
+            # Round one covers n..n+14, round two also covers n+15.
+            # Clamp the unused first-pass gather at the final candidate.
+            retained = first.gather(1, relative.clamp_max(self.proposals - 1))
+            replacement = second.gather(1, (relative - boundary[:, None]).clamp_min(0))
+            tokens = torch.where(relative < boundary[:, None], retained, replacement)
         return tokens, boundary
 
 

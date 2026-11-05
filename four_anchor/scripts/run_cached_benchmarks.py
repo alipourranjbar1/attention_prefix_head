@@ -46,11 +46,12 @@ RUNTIME_FILES = ["four_anchor/" + name for name in (
     "model.py", "data.py", "inference.py", "vllm_support.py", "vllm_ascend.py",
     "vllm_entry.py", "scripts/vllm_ascend.sh")]
 INFERENCE_VERSIONS = {"recovered": "known_bonus_cached_v1", "bonus_in_four": "bonus_in_four_cached_v2",
-                      "target_four": "target_four_materialized_v3"}
+                      "target_four": "target_four_materialized_v3", "accepted_prefix": "accepted_prefix19_v1"}
 
 
 def runtime_files(layout):
-    return RUNTIME_FILES + (["four_anchor/vllm_target_bonus.py"] if layout == "target_four" else [])
+    return RUNTIME_FILES + (["four_anchor/vllm_target_bonus.py"]
+                            if layout in {"target_four", "accepted_prefix"} else [])
 
 
 MATH_SUFFIX = "\nPlease reason step by step, and put your final answer within \\boxed{}."
@@ -297,11 +298,12 @@ def frozen_rows(name, manifests):
 
 
 def runtime_checkout(root, explicit, output, layout="recovered"):
-    if layout in {"bonus_in_four", "target_four"}:
+    if layout in {"bonus_in_four", "target_four", "accepted_prefix"}:
         if not explicit:
             raise ValueError("19-position inference requires --code-root for the new training/inference checkout")
         path = Path(explicit).resolve()
-        name = "TARGET19_RUNTIME.json" if layout == "target_four" else "BONUS19_RUNTIME.json"
+        name = {"target_four": "TARGET19_RUNTIME.json", "bonus_in_four": "BONUS19_RUNTIME.json",
+                "accepted_prefix": "ACCEPTED_PREFIX_RUNTIME.json"}[layout]
         manifest = json.loads((path / "four_anchor" / name).read_text())
         if manifest["inference_version"] != INFERENCE_VERSIONS[layout]:
             raise ValueError("Wrong 19-position runtime manifest")
@@ -361,7 +363,8 @@ def prepare(args, output, code_root, names):
     layout = getattr(args, "inference_layout", "recovered")
     new = layout != "recovered"
     plan = {"method": INFERENCE_VERSIONS[layout],
-        "code_root": str(code_root), "base_commit": GOOD_COMMIT,
+        "code_root": str(code_root), "base_commit": (
+            "01d7dea27438c6c0578215f51b19a7d89c843cea" if layout == "accepted_prefix" else GOOD_COMMIT),
         "runtime_sha256": {f: sha(code_root / f) for f in runtime_files(layout)}, "target": str(Path(args.model).resolve()),
         "checkpoint": str(Path(args.draft).resolve()), "requested_benchmarks": names,
         "limit_per_benchmark": args.limit, "selection": "first cached rows or existing frozen manifest order",
@@ -445,6 +448,8 @@ def reuse_prompts(args, output, code_root, names):
                 bonus_target_forward_required=layout == "target_four",
                 query_positions=19 if new else 20, reused_prompt_plan=str(source),
                 with_baseline=args.with_baseline, requested_benchmarks=names)
+    if layout == "accepted_prefix":
+        plan["base_commit"] = "01d7dea27438c6c0578215f51b19a7d89c843cea"
     entries = {}
     for name in names:
         entry = dict(plan["benchmarks"][name])
@@ -536,6 +541,8 @@ def run_benchmark(args, code_root, output, name, entry, mode):
             env.pop(key, None)
     root = Path(args.root).resolve()
     env.update(PYTHONPATH=f"{root}/speculators/src:{root}/speculators/hs_connectors/src",
+        SPECULATORS_ROOT=str(root / "speculators"),
+        ANCHOR_POLICY="accepted_prefix" if getattr(args, "inference_layout", "recovered") == "accepted_prefix" else "trained",
         VLLM_SOURCE_ROOT=str(root), RUN=str(Path(args.run).resolve()), MODEL=str(Path(args.model).resolve()),
         DRAFT=str(Path(args.draft).resolve()), DATA=entry["data"], OUTPUT_DIR=str(folder),
         MODE=mode, BASELINE=str(output / name / "ar/per_prompt.jsonl") if args.with_baseline and mode != "ar" else "",
@@ -605,8 +612,9 @@ def main(argv=None):
                  if args.inference_layout != "recovered" else runtime_checkout(root, args.code_root, output))
     if not args.prepare_only and args.inference_layout != "recovered":
         cfg = json.loads((Path(args.draft) / "four_anchor_config.json").read_text())["draft_config"]
+        checkpoint_layout = "target_four" if args.inference_layout == "accepted_prefix" else args.inference_layout
         if (cfg.get("anchor_layout"), cfg.get("format_version"), cfg["num_anchors"], cfg["num_proposals"]) != (
-                args.inference_layout, 3 if args.inference_layout == "target_four" else 2, 4, 15):
+                checkpoint_layout, 3 if checkpoint_layout == "target_four" else 2, 4, 15):
             raise ValueError("Evaluation requires a checkpoint trained with the requested anchor layout and 15 proposals")
     print("Recovered code:", code_root, "\nResults:", output, flush=True)
     plan = prepare(args, output, code_root, names)

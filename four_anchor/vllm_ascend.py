@@ -12,7 +12,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.worker import NPUWorker
 
-from .inference import KnownBonusDraft, BonusInFourDraft, TargetFourDraft
+from .inference import KnownBonusDraft, BonusInFourDraft, TargetFourDraft, AcceptedPrefixDraft
 from .vllm_target_bonus import materialize_bonus
 from .model import FourAnchorDFlash
 from .remote_teacher import FrozenTargetInterface
@@ -55,15 +55,18 @@ class FourAnchorProposer:
         )
         bonus_in_four = self.model.cfg.anchor_layout == "bonus_in_four"
         target_four = self.model.cfg.anchor_layout == "target_four"
-        implementation = (TargetFourDraft if target_four else
+        accepted_prefix = self.settings.anchor_policy == "accepted_prefix"
+        implementation = (AcceptedPrefixDraft if accepted_prefix else TargetFourDraft if target_four else
                           BonusInFourDraft if bonus_in_four else KnownBonusDraft)
         self.inference = implementation(
             self.model, self.history.ids.shape[1], self.settings.num_proposals,
             profile_steps=self.settings.profile_steps, draft_graph=self.settings.draft_graph)
         print(json.dumps({"event": "four_anchor_vllm_loaded",
                           "inference_version": self.settings.inference_version(),
-                          "known_bonus_slots": 1, "bonus_is_anchor": bonus_in_four or target_four,
-                          "bonus_target_forward_required": target_four,
+                          "known_bonus_slots": 1,
+                          "anchor_policy": self.settings.anchor_policy,
+                          "bonus_is_anchor": (bonus_in_four or target_four) and not accepted_prefix,
+                          "bonus_target_forward_required": target_four and not accepted_prefix,
                           "context_projection_cache": True, "draft_graph": self.settings.draft_graph,
                           "trained_proposals": self.metadata["draft_config"]["num_proposals"],
                           "serving_proposals": self.settings.num_proposals,

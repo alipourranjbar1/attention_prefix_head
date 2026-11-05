@@ -1,0 +1,14 @@
+{
+  "inference_version": "accepted_prefix19_v1",
+  "base_commit": "01d7dea27438c6c0578215f51b19a7d89c843cea",
+  "sha256": {
+    "four_anchor/model.py": "fc2c02d4f5fa32df3236ae535bc8de9995e19ad37548e2d793d50e2bd01441de",
+    "four_anchor/data.py": "0b34933dd953824bcfeaab34d735adb9bb6803222ebfb633497a3120ce988ea9",
+    "four_anchor/inference.py": "ca5086780d6742a03f6085838c77edce74f7e5f37a8b052e7253a7bc403ac508",
+    "four_anchor/vllm_support.py": "a6e50cb3a4d03989fcb253f3d218ca00c29c0a2c4a72983f546894f9914dcbda",
+    "four_anchor/vllm_ascend.py": "3866cc0f23adff229f53421dd7c78a0abad7c6cc8131a439f78a207079ec7063",
+    "four_anchor/vllm_entry.py": "389942a54ef292e2eadd4a16054d07e74b53df300bea0e09a8b2c22358ea38e4",
+    "four_anchor/scripts/vllm_ascend.sh": "76406901bb30ef97b99d934c23fb71970e96166a287be3878f72edf6000de9ac",
+    "four_anchor/vllm_target_bonus.py": "5ebbf7f61afa3a94eeb17a0ee75c7cd800093e86369e35ed165f39b7d24ff394"
+  }
+}
