@@ -1,3 +1,36 @@
+# Four-anchor DFlash: 15 speculative tokens and epoch benchmarks
+
+Branch: **`four-anchor-15-train-benchmarks`**.
+
+This recipe trains two shared-weight drafting rounds with **19 query positions**:
+**three processed past anchors + the pending bonus anchor + fifteen mask slots**.
+Native vLLM verifies exactly fifteen candidates; maximum acceptance including
+one correction/bonus is sixteen. All four first-round anchors use actual target
+hidden states, including the bonus. Round two uses target states for original
+prefix anchors and first-pass drafter states for retained proposal anchors.
+
+Obtaining the newly sampled bonus's actual target state requires one additional
+target forward before drafting. This extra call is counted in the results and
+included in timing; it does not add a query position. Both rounds remain **19**.
+
+After each completed training epoch, a separate evaluator NPU runs the eight
+cached benchmarks using frozen prompts and keeps cumulative Markdown, CSV,
+and JSON tables. Training can continue during evaluation.
+
+**[Training, exact model structure, commands, and result paths](four_anchor/TRAIN_BONUS19.md)**
+
+Checkpoint format is `3`, layout `target_four`, and inference version
+`target_four_materialized_v3`. Start a new training run for this layout; the
+superseded format-2 embedding-only checkpoint cannot be resumed here.
+The old 20-position checkpoint and
+its measured results remain a separate experiment; they are not new results
+for this 19-position model.
+
+## Earlier 20-position pipeline
+
+The documentation below describes the preserved earlier recipe. For the new
+19-position recipe use `train_bonus19_ascend.sh` and the guide linked above.
+
 **Optimized vLLM Ascend inference:** see [four_anchor/VLLM.md](four_anchor/VLLM.md). The first pass uses 4 past anchors + 1 known bonus + 15 masks (20 positions). There is no extra target forward. Context K/V is cached, anchor selection stays on-device, and optional drafter graph replay is available. Verification receives 15 proposals; maximum acceptance with one bonus is 16. CPU tests pass; the new path needs NPU validation and measured speedup.
 
 ## vLLM four-anchor inference update

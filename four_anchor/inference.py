@@ -1,8 +1,9 @@
-"""Inference-only known-bonus drafting and incremental context projection.
+"""Versioned cached drafting; target features are never fabricated or shifted.
 
-The frozen checkpoint is unchanged. A first pass has four past anchors, the
-known target correction/bonus, and M masks. The bonus has an embedding, NEVER
-a fabricated target hidden state. Pass two retains the trained query width.
+KnownBonusDraft preserves the published 20-position embedding-only inference.
+BonusInFourDraft is the superseded format-2 embedding-only 19-position variant.
+TargetFourDraft is the corrected format-3 layout: four actual target-state
+anchors, including a materialized bonus, plus fifteen masks in both rounds.
 """
 from contextlib import contextmanager
 import json
@@ -110,8 +111,9 @@ class DraftProfiler:
         if self.step < self.limit:
             print(json.dumps({"event": "four_anchor_profile", "step": self.step,
                               "synchronized_timings_ms": self.values,
-                              "extra_target_forwards": 0}), flush=True)
+                              "extra_target_forwards": getattr(self, "extra_target_forwards", 0)}), flush=True)
         self.values = {}
+        self.extra_target_forwards = 0
         self.step += 1
 
 
@@ -167,12 +169,13 @@ class KnownBonusDraft:
         span = ids.shape[1]
         key_valid = torch.cat(((self.cache.positions[:span] < n)[None],
                                valid, torch.ones_like(slot_ids, dtype=torch.bool)), dim=1)
-        mask = torch.zeros((1, 1, 4 + self.proposals + 1, span + 4 + self.proposals + 1),
+        width = 4 + slot_ids.shape[1]
+        mask = torch.zeros((1, 1, width, span + width),
                            device=x.device, dtype=x.dtype)
         mask.masked_fill_(~key_valid[:, None, None], torch.finfo(x.dtype).min)
         for layer, (k, v) in zip(self.model.layers, self.cache.memory):
             x = cached_query_layer(layer, x, k[:, :, :span], v[:, :, :span], mask, (cos, sin))
-        return self.model.norm(x[:, 4:])
+        return self.model.norm(x[:, getattr(self, "output_start", 4):])
 
     @torch.inference_mode()
     def propose(self, ids, bonus, mode="two_pass"):
@@ -181,7 +184,7 @@ class KnownBonusDraft:
         n = self.cache.length
         if n < 1 or ids.shape != (1, n):
             raise ValueError("Expected exactly the confirmed, processed target prefix")
-        if n + 2 * self.proposals + 1 > self.cache.capacity:
+        if n + getattr(self, "position_reserve", 2 * self.proposals + 1) > self.cache.capacity:
             raise ValueError("Not enough positions for the second draft pass")
         if self.graphs is not None:
             with self.profiler.region("draft_graph_replay"):
@@ -210,6 +213,107 @@ class KnownBonusDraft:
             # Fixed-sized gather avoids .item(), CPU loops, and redundant LM-head
             # work for the unused last slot. Selection never emits the bonus.
             second = self.model.lm_head(h2[:, :self.proposals]).argmax(dim=-1)
+            index = self.candidate_offsets[None]
+            replacement = second.gather(1, (index - boundary[:, None]).clamp_min(0))
+            tokens = torch.where(index < boundary[:, None], first, replacement)
+        return tokens, boundary
+
+
+class BonusInFourDraft(KnownBonusDraft):
+    """Format-2 checkpoint: [3 past anchors, bonus anchor, 15 masks].
+
+The bonus's actual target state is unavailable. Round one adds no feature
+to its embedding; round two uses its normalized first-pass draft state.
+No target call, predecessor-state substitution, or shifted feature pairing.
+"""
+    output_start = 3
+
+    def __init__(self, model, capacity, proposals=15, profile_steps=0, draft_graph=False):
+        if (model.cfg.anchor_layout, model.cfg.num_anchors, model.cfg.num_proposals, proposals) != (
+                "bonus_in_four", 4, 15, 15):
+            raise ValueError("BonusInFourDraft requires a checkpoint trained for bonus_in_four / 15")
+        self.model, self.proposals = model, proposals
+        self.cache = DraftContextCache(model, capacity)
+        device, dtype = model.embed_tokens.weight.device, model.embed_tokens.weight.dtype
+        self.anchor_offsets = torch.arange(-4, 0, device=device)
+        self.slot_offsets = torch.arange(15, device=device)
+        self.candidate_offsets = self.slot_offsets
+        self.masks = torch.full((1, 15), model.cfg.mask_token_id, device=device, dtype=torch.long)
+        self.zero_ids = torch.zeros((1, 16), device=device, dtype=torch.long)
+        self.zero_hidden = torch.zeros((1, 16, model.hidden_size), device=device, dtype=dtype)
+        self.profiler = DraftProfiler(device, profile_steps)
+        self.start_buffer = torch.zeros((), device=device, dtype=torch.long)
+        self.graphs = NpuDraftGraphs(self) if draft_graph else None
+
+    def tensor_propose(self, ids, bonus, start, mode):
+        prior_ids = torch.cat((bonus.reshape(1, 1), self.zero_ids[:, 1:]), -1)
+        with self.profiler.region("draft_first"):
+            # Zero draft input produces exactly zero added feature (bias-free
+            # linear + RMSNorm). The bonus is the fourth anchor, at position n.
+            h1 = self.pass_hidden(ids, start, start + 1, prior_ids, self.zero_hidden, self.masks)
+            logits = self.model.lm_head(h1[:, 1:])
+            first = logits.argmax(-1)
+        if mode == "one_pass":
+            return first, None
+        with self.profiler.region("boundary_and_anchors"):
+            boundary = boundary_scores(logits).argmax(-1)
+            prior_ids = torch.cat((bonus.reshape(1, 1), first), -1)
+            restart = start + 1 + boundary[0]
+        with self.profiler.region("draft_second"):
+            h2 = self.pass_hidden(ids, start, restart, prior_ids, h1, self.masks)
+            second = self.model.lm_head(h2[:, 1:]).argmax(-1)
+            index = self.candidate_offsets[None]
+            replacement = second.gather(1, (index - boundary[:, None]).clamp_min(0))
+            tokens = torch.where(index < boundary[:, None], first, replacement)
+        return tokens, boundary
+
+
+class TargetFourDraft(KnownBonusDraft):
+    """Four actual target-state anchors + 15 masks, in both passes.
+
+The supplied processed prefix MUST already include the bonus and its actual
+target state. Round two retains the original target/draft source-selection
+rule. The model runner owns bonus materialization and counts that target call.
+"""
+    requires_materialized_bonus = True
+    position_reserve = 30
+
+    def __init__(self, model, capacity, proposals=15, profile_steps=0, draft_graph=False):
+        if (model.cfg.anchor_layout, model.cfg.num_anchors, model.cfg.num_proposals, proposals) != (
+                "target_four", 4, 15, 15):
+            raise ValueError("TargetFourDraft requires a format-3 target_four / 15 checkpoint")
+        self.model, self.proposals = model, proposals
+        self.cache = DraftContextCache(model, capacity)
+        device, dtype = model.embed_tokens.weight.device, model.embed_tokens.weight.dtype
+        self.anchor_offsets = torch.arange(-4, 0, device=device)
+        self.slot_offsets = torch.arange(15, device=device)
+        self.candidate_offsets = self.slot_offsets
+        self.masks = torch.full((1, 15), model.cfg.mask_token_id, device=device, dtype=torch.long)
+        self.zero_ids = torch.zeros_like(self.masks)
+        self.zero_hidden = torch.zeros((1, 15, model.hidden_size), device=device, dtype=dtype)
+        self.zero_bonus = torch.zeros((1, 1), device=device, dtype=torch.long)
+        self.profiler = DraftProfiler(device, profile_steps)
+        self.start_buffer = torch.zeros((), device=device, dtype=torch.long)
+        self.graphs = NpuDraftGraphs(self) if draft_graph else None
+
+    def propose(self, ids, bonus=None, mode="two_pass"):
+        if bonus is not None:
+            raise ValueError("The bonus must already be part of the processed target prefix")
+        return super().propose(ids, self.zero_bonus, mode)
+
+    def tensor_propose(self, ids, _unused_bonus, start, mode):
+        with self.profiler.region("draft_first"):
+            h1 = self.pass_hidden(ids, start, start, self.zero_ids, self.zero_hidden, self.masks)
+            logits = self.model.lm_head(h1)
+            first = logits.argmax(-1)
+        if mode == "one_pass":
+            return first, None
+        with self.profiler.region("boundary_and_anchors"):
+            boundary = boundary_scores(logits).argmax(-1)
+            restart = start + boundary[0]
+        with self.profiler.region("draft_second"):
+            h2 = self.pass_hidden(ids, start, restart, first, h1, self.masks)
+            second = self.model.lm_head(h2).argmax(-1)
             index = self.candidate_offsets[None]
             replacement = second.gather(1, (index - boundary[:, None]).clamp_min(0))
             tokens = torch.where(index < boundary[:, None], first, replacement)
@@ -262,7 +366,7 @@ class NpuDraftGraphs:
                         outputs = self.draft.tensor_propose(ids, bonus, length, mode)
                 except RuntimeError as exc:
                     raise RuntimeError("Drafter ACLGraph capture failed. Run with DRAFT_GRAPH=0; "
-                                       "the cached no-extra-target-forward path remains available.") from exc
+                                       "the eager drafter remains available.") from exc
                 api.current_stream().wait_stream(stream)
                 self.entries[key] = (graph, ids, bonus, length, outputs)
             api.synchronize()

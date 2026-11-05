@@ -2,7 +2,7 @@
 # Four-anchor regular DFlash; five bidirectional layers; target 0,1 / trainers 2..7.
 set -eo pipefail
 FOUR_ANCHOR_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-SPEC_DIR="$FOUR_ANCHOR_ROOT/speculators"
+SPEC_DIR="${SPECULATORS_ROOT:-$FOUR_ANCHOR_ROOT/speculators}"
 : "${CONDA_PREFIX:?Activate attention_prefix_ali first}"
 if [[ -z "${CANN_ROOT:-}" ]]; then
     for candidate in /home/n84449292/a84384644/CANN/9.1.0 /home/n84449292/m84379596/CANN/9.1.0; do
@@ -86,6 +86,7 @@ if [[ "$DISTRIBUTED_STRATEGY" == fsdp ]]; then
         --nnodes=1 --nproc_per_node="${#train_devices[@]}" \
         --master_addr=127.0.0.1 --master_port="${MASTER_PORT:-29647}" \
         -m four_anchor.fsdp_check --device npu --dtype bfloat16 \
+        --anchor-layout "${ANCHOR_LAYOUT:-past}" \
         --packed-execution "$PACKED_EXECUTION" \
         --output "$OUTPUT_DIR/fsdp_check" 2>&1 | tee "$OUTPUT_DIR/fsdp_check.log"
 fi

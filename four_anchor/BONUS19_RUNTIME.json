@@ -1,0 +1,12 @@
+{
+  "inference_version": "bonus_in_four_cached_v2",
+  "sha256": {
+    "four_anchor/model.py": "fc2c02d4f5fa32df3236ae535bc8de9995e19ad37548e2d793d50e2bd01441de",
+    "four_anchor/data.py": "0b34933dd953824bcfeaab34d735adb9bb6803222ebfb633497a3120ce988ea9",
+    "four_anchor/inference.py": "01218c58c1b14a4d7901272eaa3e64ff6e2d6e9537e8ea70f3fa972cd23c2616",
+    "four_anchor/vllm_support.py": "5652336dd0054e417c57a12b87711526358a7b970f6e69e7d3b1d88d2708473e",
+    "four_anchor/vllm_ascend.py": "d7777cb201fc6dd873397720f23bc6aac20a6ca7d3166ad2779794895534d109",
+    "four_anchor/vllm_entry.py": "bf02a014bfe1956d76f3bab3164541b7433c391e33a13fe09859d0d1b81dcdd3",
+    "four_anchor/scripts/vllm_ascend.sh": "2f1411d550b2bcd2979a6fe266f00d3be4afe4fd2edfdfc98906ced8d8376bc0"
+  }
+}

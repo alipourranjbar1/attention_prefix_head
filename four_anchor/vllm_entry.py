@@ -63,6 +63,15 @@ def summarize(rows):
             "acceptance_note": "vLLM verification accounting, before EOS/output-budget truncation; anchors excluded"}
 
 
+def worker_counters(llm):
+    values = llm.collective_rpc("four_anchor_counters")
+    if len(values) != 1 or set(values[0]) != {"extra_target_forwards", "bonus_page_fallbacks"}:
+        raise RuntimeError("Expected counters from exactly one four-anchor worker")
+    if any(type(v) is not int or v < 0 for v in values[0].values()):
+        raise RuntimeError("Invalid target-forward counters")
+    return values[0]
+
+
 def evaluate(args, options):
     from transformers import AutoTokenizer
     from tqdm import tqdm
@@ -90,12 +99,15 @@ def evaluate(args, options):
     if (output / "per_prompt.jsonl").exists():
         raise ValueError("Use a fresh OUTPUT_DIR; per_prompt.jsonl already exists")
     (output / "engine_config.json").write_text(json.dumps(options, indent=2) + "\n")
+    version = (ServingSettings(args.checkpoint, args.proposals).inference_version()
+               if args.mode != "ar" else "ar")
     llm = LLM(**options)
     params = SamplingParams(temperature=0, max_tokens=args.max_new_tokens, seed=42,
                             repetition_penalty=1, presence_penalty=0, frequency_penalty=0)
     for _ in range(args.warmup):
         llm.generate([{"prompt_token_ids": prompts[0]}],
                      SamplingParams(temperature=0, max_tokens=min(32, args.max_new_tokens)), use_tqdm=False)
+    counters = worker_counters(llm) if version == "target_four_materialized_v3" else None
     rows = []
     with (output / "per_prompt.jsonl").open("x") as stream:
         for i, prompt in enumerate(tqdm(prompts, desc=f"vLLM {args.mode}", unit="prompt")):
@@ -115,6 +127,13 @@ def evaluate(args, options):
                    "token_ids": list(result.token_ids), "output_tokens": len(result.token_ids),
                    "seconds": seconds, "tokens_per_second": len(result.token_ids) / max(seconds, 1e-9),
                    "speculative_decoding": metrics}
+            if counters is not None:
+                after = worker_counters(llm)  # after the timed generate call
+                delta = {key: after[key] - counters[key] for key in counters}
+                if any(v < 0 for v in delta.values()):
+                    raise RuntimeError("Worker counters reset during evaluation")
+                row.update(delta)
+                counters = after
             if baseline is not None:
                 row["matches_greedy_target"] = row["token_ids"] == baseline[i]["token_ids"]
             stream.write(json.dumps(row) + "\n")
@@ -122,11 +141,19 @@ def evaluate(args, options):
             rows.append(row)
             print(json.dumps({k: v for k, v in row.items() if k not in {"prompt_token_ids", "token_ids"}}), flush=True)
     summary = summarize(rows)
-    summary.update(draft_graph=getattr(args, "draft_graph", False) and args.mode != "ar", inference_version="known_bonus_cached_v1", extra_target_forwards=0,
+    summary.update(draft_graph=getattr(args, "draft_graph", False) and args.mode != "ar", inference_version=version,
+                   extra_target_forwards=sum(r.get("extra_target_forwards", 0) for r in rows),
+                   bonus_page_fallbacks=sum(r.get("bonus_page_fallbacks", 0) for r in rows),
                    profiling_enabled=getattr(args, "profile_steps", 0) > 0,
                    mode=args.mode, conditioning_anchors=4 if args.mode != "ar" else 0,
                    speculative_tokens=args.proposals if args.mode != "ar" else 0,
                    parity_checked=baseline is not None)
+    if version == "target_four_materialized_v3":
+        if summary["extra_target_forwards"] < summary["verification_cycles"]:
+            raise RuntimeError("Target-state drafting is missing its bonus-forward accounting")
+        summary["acceptance_note"] += "; bonus-materialization forwards are additional and excluded from verification-cycle denominator"
+        summary["query_positions"] = 19
+        summary["first_round_target_anchor_states"] = 4
     if baseline is not None:
         summary["matching_prompts"] = sum(r["matches_greedy_target"] for r in rows)
         summary["all_match_greedy_target"] = all(r["matches_greedy_target"] for r in rows)

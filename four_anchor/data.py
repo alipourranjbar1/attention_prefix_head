@@ -39,7 +39,7 @@ def load_records(path, split="train"):
     return load_dataset("json", data_files=str(path), split="train")
 
 
-def _trainable_batch(batch, max_sequence_length):
+def _trainable_batch(batch, max_sequence_length, min_start=1):
     """Arrow batch predicate: match training_example's usable prefix window.
 
     Keep the scan in Arrow instead of decoding billions of tokens into Python.
@@ -55,7 +55,7 @@ def _trainable_batch(batch, max_sequence_length):
     ids = pc.list_slice(ids, 0, max_sequence_length)
     lengths = pc.list_value_length(ids)
     if "loss_mask" not in batch.column_names:
-        return pc.greater(lengths, 1).to_numpy(zero_copy_only=False)
+        return pc.greater(lengths, min_start).to_numpy(zero_copy_only=False)
     masks = batch["loss_mask"].combine_chunks()
     if masks.null_count:
         raise ValueError("loss_mask contains a null sequence")
@@ -70,7 +70,7 @@ def _trainable_batch(batch, max_sequence_length):
         raise ValueError("loss_mask weights must be finite and nonnegative")
     # Position zero cannot be predicted from a nonempty prefix. The stop index
     # also excludes supervision that disappears under training-time truncation.
-    candidates = pc.list_slice(masks, 1, max_sequence_length)
+    candidates = pc.list_slice(masks, min_start, max_sequence_length)
     positive = pc.greater(pc.cast(pc.list_flatten(candidates), pa.float64()), 0)
     parents = pc.filter(pc.list_parent_indices(candidates), positive)
     keep = np.zeros(len(batch), dtype=bool)
@@ -78,7 +78,7 @@ def _trainable_batch(batch, max_sequence_length):
     return keep
 
 
-def filter_training_records(data, max_sequence_length, cache_dir):
+def filter_training_records(data, max_sequence_length, cache_dir, min_start=1):
     """Cache a shared row-index filter before creating any distributed sampler.
 
     The original dataset is read-only. A file lock lets all local DDP ranks use
@@ -95,6 +95,8 @@ def filter_training_records(data, max_sequence_length, cache_dir):
         raise ValueError("max_sequence_length must be at least two")
     identity = {"filter_version": 1, "source_fingerprint": data._fingerprint,
                 "max_sequence_length": max_sequence_length}
+    if min_start != 1:
+        identity["min_start"] = min_start
     fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     cache = Path(cache_dir).expanduser().resolve()
     cache.mkdir(parents=True, exist_ok=True)
@@ -102,7 +104,7 @@ def filter_training_records(data, max_sequence_length, cache_dir):
     with FileLock(str(index_file) + ".lock"):
         filtered = data.with_format("arrow").filter(
             _trainable_batch, batched=True, batch_size=512,
-            fn_kwargs={"max_sequence_length": max_sequence_length},
+            fn_kwargs={"max_sequence_length": max_sequence_length, "min_start": min_start},
             cache_file_name=str(index_file), load_from_cache_file=True,
             new_fingerprint=fingerprint, desc="Filtering rows without usable supervision",
         ).with_format(None)

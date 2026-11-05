@@ -21,7 +21,7 @@ from .runtime import resolve_device
 from .train import TrainConfig
 
 
-def run_check(device, output, dtype="bfloat16", packed_execution="cached"):
+def run_check(device, output, dtype="bfloat16", packed_execution="cached", anchor_layout="past"):
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.manual_seed(193)
     # Keep a conventional accelerator attention head size (128), while making
@@ -31,14 +31,18 @@ def run_check(device, output, dtype="bfloat16", packed_execution="cached"):
                         max_position_embeddings=128, eos_token_id=None, pad_token_id=0)
     config._attn_implementation = "sdpa"
     target = Qwen3ForCausalLM(config).to(device=device, dtype=getattr(torch, dtype)).eval().requires_grad_(False)
-    draft = FourAnchorDFlash(DraftConfig("fsdp-preflight", [0, 1], 63, num_draft_layers=2, num_proposals=4), target)
+    proposals = 15 if anchor_layout != "past" else 4
+    draft = FourAnchorDFlash(DraftConfig("fsdp-preflight", [0, 1], 63, num_draft_layers=2, num_proposals=proposals,
+                                       anchor_layout=anchor_layout,
+                                       format_version={"past": 1, "bonus_in_four": 2, "target_four": 3}[anchor_layout]), target)
     for p in draft.parameters():
         if p.requires_grad:
             p.data = p.data.float()
     draft.gradient_checkpointing = True
     cfg = TrainConfig("fsdp-preflight", "synthetic", str(output), 63, [0, 1], device=str(device), dtype=dtype,
                       training_mode="packed", distributed_strategy="fsdp", epochs=1, num_workers=0,
-                      num_proposals=4, max_anchors=16, blocks_per_chunk=2, head_chunk_size=7,
+                      num_proposals=proposals, max_anchors=16, blocks_per_chunk=2, head_chunk_size=7,
+                      anchor_layout=anchor_layout,
                       max_sequence_length=32, loss_fn={"ce": .1, "tv": .9}, packed_execution=packed_execution)
     task = PackedTask(draft, target.model.norm, cfg, random.Random(321 + rank)).train()
     full_elements = sum(p.numel() for p in draft.parameters() if p.requires_grad)
@@ -112,12 +116,13 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
     parser.add_argument("--packed-execution", choices=["reference", "cached"], default="cached")
+    parser.add_argument("--anchor-layout", choices=["past", "bonus_in_four", "target_four"], default="past")
     args = parser.parse_args()
     device = resolve_device(f"{args.device}:{os.environ.get('LOCAL_RANK', '0')}" if args.device != "cpu" else "cpu")
     dist.init_process_group(backend={"npu": "hccl", "cuda": "nccl"}.get(device.type, "gloo"),
                             timeout=timedelta(seconds=180))
     try:
-        run_check(device, args.output, args.dtype, args.packed_execution)
+        run_check(device, args.output, args.dtype, args.packed_execution, args.anchor_layout)
     finally:
         dist.destroy_process_group()
 

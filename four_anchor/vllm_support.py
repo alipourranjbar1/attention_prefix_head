@@ -33,15 +33,27 @@ class ServingSettings:
         cfg = metadata["draft_config"]
         if cfg["num_anchors"] != 4:
             raise ValueError("This adapter requires four conditioning anchors")
-        if self.num_proposals + 1 > cfg["num_proposals"]:
+        layout = cfg.get("anchor_layout", "past")
+        if layout in {"bonus_in_four", "target_four"}:
+            version = 3 if layout == "target_four" else 2
+            if (cfg.get("format_version"), cfg["num_proposals"], self.num_proposals) != (version, 15, 15):
+                raise ValueError(f"{layout} requires a format-{version} checkpoint trained for 15 proposals")
+        elif layout != "past":
+            raise ValueError("Unknown checkpoint anchor layout")
+        elif self.num_proposals + 1 > cfg["num_proposals"]:
             raise ValueError("Serving proposals plus the known bonus cannot exceed the trained slot count")
         if not (path / "model.safetensors").is_file():
             raise ValueError("Checkpoint model.safetensors is missing")
         return metadata
 
+    def inference_version(self):
+        layout = self.metadata()["draft_config"].get("anchor_layout", "past")
+        return {"past": "known_bonus_cached_v1", "bonus_in_four": "bonus_in_four_cached_v2",
+                "target_four": "target_four_materialized_v3"}[layout]
+
     def apply(self, drafter):
-        # Preserve the checkpoint's trained slot count. Inference uses M+1
-        # slots, fixing slot zero to the known bonus on the first pass.
+        # The versioned proposer owns the query layout; never rewrite a
+        # checkpoint's trained slot count or hidden-state alignment here.
         self.metadata()
 
 

@@ -82,7 +82,9 @@ def train_packed(cfg):
     if cfg.max_sequence_length + 2 * cfg.num_proposals > target.config.max_position_embeddings:
         raise ValueError("Target context window must allow two proposal blocks beyond the sequence length")
     draft_cfg = DraftConfig(cfg.target, cfg.target_layer_ids, cfg.mask_token_id, cfg.num_draft_layers,
-                            cfg.num_anchors, cfg.num_proposals, cfg.attention, cfg.target_revision)
+                            cfg.num_anchors, cfg.num_proposals, cfg.attention, cfg.target_revision,
+                            format_version={"past": 1, "bonus_in_four": 2, "target_four": 3}[cfg.anchor_layout],
+                            anchor_layout=cfg.anchor_layout)
     draft = FourAnchorDFlash.load(cfg.resume, target, trainable_dtype=torch.float32) if cfg.resume else FourAnchorDFlash(draft_cfg, target)
     if asdict(draft.cfg) != asdict(draft_cfg):
         raise ValueError("Resume model configuration differs")
@@ -108,7 +110,7 @@ def train_packed(cfg):
         previous = asdict(TrainConfig(**state["train_config"]))
         operational = {"output", "resume", "initialize_dflash", "device", "checkpoint_every", "log_every",
                        "max_steps", "tensorboard", "vllm_endpoint", "hidden_states_dir", "data_cache_dir",
-                       "progress", "num_workers", "profile_steps"}
+                       "progress", "num_workers", "profile_steps", "epoch_benchmark_dir"}
         changes = [k for k, v in previous.items() if k not in operational and asdict(cfg)[k] != v]
         if changes or previous["training_mode"] != "packed":
             raise ValueError(f"Resume recipe differs: {changes}; use a fresh run for the packed objective")
@@ -162,6 +164,9 @@ def train_packed(cfg):
             dist.barrier()
         if rank == 0:
             (output / "latest_checkpoint.txt").write_text(str(path.resolve()) + "\n")
+            if cfg.epoch_benchmark_dir and batch_offset == 0 and next_epoch > 0:
+                from .epoch_benchmarks import publish_epoch
+                publish_epoch(cfg.epoch_benchmark_dir, path, next_epoch, step)
         saved = str(path)
 
     try:
@@ -250,7 +255,7 @@ def train_packed(cfg):
                            "redraft_blocks_computed": metrics[13].item(),
                            "learning_rate": optimizer.param_groups[0]["lr"], "grad_norm": float(grad_norm),
                            "estimated_remaining_seconds": elapsed / (step - initial_step) * (total_steps - step)}
-                    if cfg.packed_execution == "cached" and not (cfg.loss_fn or {}).get("kl_div", 0):
+                    if (cfg.packed_execution == "cached" or cfg.anchor_layout == "bonus_in_four") and not (cfg.loss_fn or {}).get("kl_div", 0):
                         row.pop("first_kl")
                         row.pop("second_kl")
                     if profile:

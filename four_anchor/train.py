@@ -76,8 +76,17 @@ class TrainConfig:
     distributed_strategy: str = "ddp"
     packed_execution: str = "reference"
     profile_steps: int = 0
+    anchor_layout: str = "past"
+    epoch_benchmark_dir: str | None = None
 
     def __post_init__(self):
+        if self.anchor_layout not in {"past", "bonus_in_four", "target_four"}:
+            raise ValueError("Unknown anchor_layout")
+        if self.anchor_layout in {"bonus_in_four", "target_four"} and (
+                self.training_mode != "packed" or self.num_anchors != 4 or self.num_proposals != 15):
+            raise ValueError("19-position layouts require packed training, four anchors and 15 proposals")
+        if self.epoch_benchmark_dir and (self.training_mode != "packed" or not self.checkpoint_each_epoch):
+            raise ValueError("Epoch benchmarks require packed training and checkpoint_each_epoch")
         if self.steps < 1 or self.gradient_accumulation < 1 or self.max_sequence_length < 2:
             raise ValueError("steps/accumulation must be positive; max_sequence_length >= 2")
         if self.loss_decay <= 0 or self.redraft_weight <= 0:

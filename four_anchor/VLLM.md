@@ -1,3 +1,5 @@
+> For the new **19-position training and inference recipe**, see [TRAIN_BONUS19.md](TRAIN_BONUS19.md). This document retains the earlier 20-position experiment and benchmark instructions.
+
 # Four-anchor vLLM inference: known bonus and cached context
 
 This version reuses the trained checkpoint and removes the additional target

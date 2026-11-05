@@ -29,6 +29,7 @@ class DraftConfig:
     attention: str = "sdpa"
     target_revision: str | None = None
     format_version: int = 1
+    anchor_layout: str = "past"
 
     def __post_init__(self):
         if self.num_anchors < 1 or self.num_proposals < 1 or self.num_draft_layers < 1:
@@ -37,8 +38,18 @@ class DraftConfig:
             raise ValueError("target_layer_ids must be a nonempty list of distinct decoder indices")
         if self.attention not in {"sdpa", "eager"}:
             raise ValueError("This reference backend supports sdpa and eager attention")
-        if self.format_version != 1:
+        if self.format_version not in {1, 2, 3}:
             raise ValueError("Unsupported four-anchor checkpoint version")
+        if self.anchor_layout not in {"past", "bonus_in_four", "target_four"}:
+            raise ValueError("Unknown anchor_layout")
+        if self.anchor_layout == "bonus_in_four":
+            if (self.format_version, self.num_anchors, self.num_proposals) != (2, 4, 15):
+                raise ValueError("bonus_in_four requires format_version=2, four anchors and 15 proposals")
+        elif self.anchor_layout == "target_four":
+            if (self.format_version, self.num_anchors, self.num_proposals) != (3, 4, 15):
+                raise ValueError("target_four requires format_version=3, four target anchors and 15 proposals")
+        elif self.format_version != 1:
+            raise ValueError("Legacy past-anchor checkpoints use format_version=1")
 
 
 @dataclass
@@ -47,7 +58,7 @@ class Anchors:
     positions: torch.Tensor       # [1, A], original absolute positions
     target_features: torch.Tensor # [1, A, F]
     draft_features: torch.Tensor  # [1, A, H]
-    source: torch.Tensor          # [1, A]: 0=padding, 1=target, 2=first-pass drafter
+    source: torch.Tensor          # [1, A]: 0=padding, 1=target, 2=draft, 3=embedding-only bonus
 
 
 @dataclass
@@ -206,7 +217,7 @@ class FourAnchorDFlash(nn.Module):
         save_file(state, str(path / "model.safetensors"))
 
     def packed_hidden(self, features, context_positions, document_ids, anchors,
-                      starts, context_limits, block_documents, memory=None):
+                      starts, context_limits, block_documents, memory=None, include_bonus=False):
         """Independent blocks sharing packed context memory; no cross-document KV.
 
         starts/context_limits are *document-relative* positions. Pass two moves
@@ -250,7 +261,9 @@ class FourAnchorDFlash(nn.Module):
                 x = checkpoint(run, *args, use_reentrant=False)
             else:
                 x = run(*args)
-        return self.norm(x.reshape(g, a + m, -1)[:, a:])
+        # The last anchor's first-pass state conditions the next pass. It is
+        # NOT a target state and is never supervised as a speculative token.
+        return self.norm(x.reshape(g, a + m, -1)[:, a - int(include_bonus):])
 
     def packed_memory(self, features, positions):
         """Project shared context and each layer's K/V once, with gradients intact."""
