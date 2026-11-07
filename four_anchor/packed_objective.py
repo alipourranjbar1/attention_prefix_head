@@ -91,6 +91,9 @@ class PackedTask(nn.Module):
                 torch.cat(tokens).reshape(hidden.shape[:2]), torch.cat(confidence).reshape(hidden.shape[:2]))
 
     def forward(self, batch):
+        if self.cfg.anchor_layout == "bonus_addon":
+            from .bonus_addon_objective import bonus_addon_forward
+            return bonus_addon_forward(self, batch)
         if self.cfg.anchor_layout == "bonus_in_four":
             from .bonus_objective import bonus_forward
             return bonus_forward(self, batch)

@@ -10,7 +10,11 @@ if [[ -z "${CANN_ROOT:-}" ]]; then
     done
 fi
 if [[ -n "${CANN_ROOT:-}" ]]; then
-    source "$CANN_ROOT/cann/set_env.sh"
+    if [[ -f "$CANN_ROOT/cann/set_env.sh" ]]; then
+        source "$CANN_ROOT/cann/set_env.sh"
+    else
+        source "$CANN_ROOT/ascend-toolkit/set_env.sh"
+    fi
     export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
     DFLASH_TORCH_ABI=$(TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c 'import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))')
     source "$CANN_ROOT/nnal/atb/set_env.sh" --cxx_abi="$DFLASH_TORCH_ABI"
@@ -56,7 +60,11 @@ print('Preflight imports OK: regular DFlash, remote teacher client, TensorBoard'
 PY
 python -m four_anchor.ascend_config
 printf 'Packed token budget: %s per rank; up to %s sampled training blocks; loss=%s\n' "$SEQ_LENGTH" "$MAX_ANCHORS" "$LOSS_FN"
-printf 'Training layout: 4 conditioning anchors + %s new slots; all five draft layers bidirectional.\n' "$BLOCK_SIZE"
+if [[ "${ANCHOR_LAYOUT:-past}" == bonus_addon ]]; then
+    printf 'Training: round 1 = 4 target anchors + bonus embedding + 15 masks (20); round 2 = 4 drafter anchors + 15 masks (19).\n'
+else
+    printf 'Training layout: 4 conditioning anchors + %s new slots; all five draft layers bidirectional.\n' "$BLOCK_SIZE"
+fi
 printf 'Distributed strategy: %s\n' "$DISTRIBUTED_STRATEGY"
 IFS=',' read -r -a train_devices <<< "$TRAIN_NPUS"
 # Count real packed updates before starting either the target server or trainers.

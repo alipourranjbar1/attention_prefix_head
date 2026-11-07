@@ -34,7 +34,7 @@ def run_check(device, output, dtype="bfloat16", packed_execution="cached", ancho
     proposals = 15 if anchor_layout != "past" else 4
     draft = FourAnchorDFlash(DraftConfig("fsdp-preflight", [0, 1], 63, num_draft_layers=2, num_proposals=proposals,
                                        anchor_layout=anchor_layout,
-                                       format_version={"past": 1, "bonus_in_four": 2, "target_four": 3}[anchor_layout]), target)
+                                       format_version={"past": 1, "bonus_in_four": 2, "target_four": 3, "bonus_addon": 4}[anchor_layout]), target)
     for p in draft.parameters():
         if p.requires_grad:
             p.data = p.data.float()
@@ -116,7 +116,7 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
     parser.add_argument("--packed-execution", choices=["reference", "cached"], default="cached")
-    parser.add_argument("--anchor-layout", choices=["past", "bonus_in_four", "target_four"], default="past")
+    parser.add_argument("--anchor-layout", choices=["past", "bonus_in_four", "target_four", "bonus_addon"], default="past")
     args = parser.parse_args()
     device = resolve_device(f"{args.device}:{os.environ.get('LOCAL_RANK', '0')}" if args.device != "cpu" else "cpu")
     dist.init_process_group(backend={"npu": "hccl", "cuda": "nccl"}.get(device.type, "gloo"),

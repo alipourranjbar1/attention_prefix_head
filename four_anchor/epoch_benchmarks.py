@@ -78,6 +78,7 @@ def report(directory):
     write_json(directory / "epoch_results.json", {"epochs": states, "rows": rows})
     if not rows:
         return
+    addon = any(state.get("inference_layout") == "bonus_addon_batch" for state in states)
     csv_path = directory / "epoch_results.csv"
     with csv_path.with_suffix(".csv.tmp").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]), lineterminator="\n")
@@ -92,6 +93,12 @@ def report(directory):
         "Evaluation runs on a separate NPU concurrently with training; host contention may affect throughput.", "",
         "| Epoch | Step | Benchmark | Status | Prompts | Acceptance + bonus | Tokens/s | Extra target forwards |",
         "|---:|---:|---|---|---:|---:|---:|---:|"]
+    if addon:
+        limits = sorted({state.get("concurrency", 32) for state in states})
+        lines[2:5] = [
+            "Round one: 4 target-state anchors + known bonus embedding + 15 masks (20 queries).",
+            "Round two: 4 first-pass drafter-state anchors + 15 masks (19 queries). No extra target forward.",
+            f"Concurrency limits: {limits}. Greedy BF16, graphs off; throughput is aggregate tokens/s."]
     def fmt(v):
         return "—" if v is None else f"{v:.3f}" if isinstance(v, float) else str(v)
     for row in rows:
@@ -104,11 +111,17 @@ def report(directory):
 
 
 def suite_command(args, output, draft):
-    cmd = [sys.executable, str(Path(args.code_root) / "four_anchor/scripts/run_cached_benchmarks.py"),
-        "--root", args.root, "--code-root", args.code_root, "--inference-layout", "target_four",
+    layout = getattr(args, "inference_layout", "target_four")
+    script = "run_batched_benchmarks.py" if layout == "bonus_addon_batch" else "run_cached_benchmarks.py"
+    cmd = [sys.executable, str(Path(args.code_root) / "four_anchor/scripts" / script),
+        "--root", args.root, "--code-root", args.code_root, "--inference-layout", layout,
         "--run", args.run, "--model", args.model, "--draft", str(draft),
         "--output", str(output), "--npu", str(args.npu), "--limit", str(args.limit),
         "--max-new-tokens", str(args.max_new_tokens), "--datasets", "all"]
+    if layout == "bonus_addon_batch":
+        cmd += ["--concurrency", str(getattr(args, "concurrency", 32))]
+    if getattr(args, "cache_dir", None):
+        cmd += ["--cache-dir", args.cache_dir]
     return cmd
 
 
@@ -133,7 +146,9 @@ def worker(args):
                 attempt = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
                 output = directory / f"epoch-{job['epoch']:03d}" / attempt
                 output.parent.mkdir(parents=True, exist_ok=True)
-                state = dict(job, output=str(output), status="running", concurrent_training=True)
+                state = dict(job, output=str(output), status="running", concurrent_training=True,
+                             inference_layout=getattr(args, "inference_layout", "target_four"),
+                             concurrency=getattr(args, "concurrency", 1))
                 write_json(state_path, state)
                 report(directory)
                 try:
@@ -174,6 +189,9 @@ def main(argv=None):
     parser.add_argument("--limit", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--prompt-plan")
+    parser.add_argument("--inference-layout", choices=["target_four", "bonus_addon_batch"], default="target_four")
+    parser.add_argument("--concurrency", type=int, default=1)
+    parser.add_argument("--cache-dir")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--exit-code", type=int, default=0)

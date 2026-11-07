@@ -63,7 +63,8 @@ if __name__ == "__main__":
     (out / "train_config.json").write_text(json.dumps(asdict(cfg), indent=2) + "\n")
     settings = {"target_npus": os.environ["TARGET_NPUS"], "train_npus": os.environ["TRAIN_NPUS"],
                 "conditioning_anchors": 4, "new_tokens_per_pass": cfg.num_proposals,
-                "query_positions": 4 + cfg.num_proposals, "max_blocks_per_packed_batch": cfg.max_anchors,
+                "query_positions": ({"round_one": 20, "round_two": 19} if cfg.anchor_layout == "bonus_addon"
+                                    else 4 + cfg.num_proposals), "max_blocks_per_packed_batch": cfg.max_anchors,
                 "training_mode": cfg.training_mode, "loss_fn": cfg.loss_fn,
                 "distributed_strategy": cfg.distributed_strategy,
                 "packed_execution": cfg.packed_execution,

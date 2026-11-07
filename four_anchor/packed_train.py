@@ -83,7 +83,7 @@ def train_packed(cfg):
         raise ValueError("Target context window must allow two proposal blocks beyond the sequence length")
     draft_cfg = DraftConfig(cfg.target, cfg.target_layer_ids, cfg.mask_token_id, cfg.num_draft_layers,
                             cfg.num_anchors, cfg.num_proposals, cfg.attention, cfg.target_revision,
-                            format_version={"past": 1, "bonus_in_four": 2, "target_four": 3}[cfg.anchor_layout],
+                            format_version={"past": 1, "bonus_in_four": 2, "target_four": 3, "bonus_addon": 4}[cfg.anchor_layout],
                             anchor_layout=cfg.anchor_layout)
     draft = FourAnchorDFlash.load(cfg.resume, target, trainable_dtype=torch.float32) if cfg.resume else FourAnchorDFlash(draft_cfg, target)
     if asdict(draft.cfg) != asdict(draft_cfg):
@@ -255,7 +255,7 @@ def train_packed(cfg):
                            "redraft_blocks_computed": metrics[13].item(),
                            "learning_rate": optimizer.param_groups[0]["lr"], "grad_norm": float(grad_norm),
                            "estimated_remaining_seconds": elapsed / (step - initial_step) * (total_steps - step)}
-                    if (cfg.packed_execution == "cached" or cfg.anchor_layout == "bonus_in_four") and not (cfg.loss_fn or {}).get("kl_div", 0):
+                    if (cfg.packed_execution == "cached" or cfg.anchor_layout in {"bonus_in_four", "bonus_addon"}) and not (cfg.loss_fn or {}).get("kl_div", 0):
                         row.pop("first_kl")
                         row.pop("second_kl")
                     if profile:
