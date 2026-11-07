@@ -17,7 +17,8 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 DFLASH_TORCH_ABI=$(TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -c 'import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))')
 source "$CANN_ROOT/nnal/atb/set_env.sh" --cxx_abi="$DFLASH_TORCH_ABI"
 set -u
-export PYTHONPATH="$ROOT:$ROOT/speculators/src:$ROOT/speculators/hs_connectors/src:$VLLM_SOURCE_ROOT/vllm:$VLLM_SOURCE_ROOT/vllm-ascend:${PYTHONPATH:-}"
+SPECULATORS_ROOT="${SPECULATORS_ROOT:-$VLLM_SOURCE_ROOT/speculators}"
+export PYTHONPATH="$ROOT:$SPECULATORS_ROOT/src:$SPECULATORS_ROOT/hs_connectors/src:$VLLM_SOURCE_ROOT/vllm:$VLLM_SOURCE_ROOT/vllm-ascend:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="${ATB_HOME_PATH:?ATB environment missing}/lib:$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 export ASCEND_RT_VISIBLE_DEVICES="${EVAL_NPU:-7}"
 export VLLM_USE_V2_MODEL_RUNNER=0 TORCH_COMPILE_DISABLE=1 TORCHDYNAMO_DISABLE=1
@@ -44,6 +45,7 @@ if [[ "${TRACE_STEPS:-0}" != 0 && "${TRACE_STEPS:-0}" != 1 ]]; then
     echo "TRACE_STEPS must be 0 or 1" >&2; exit 2
 fi
 args=("$command" --target "$MODEL" --checkpoint "$DRAFT" --mode "${MODE:-two_pass}"
+      --anchor-policy "${ANCHOR_POLICY:-trained}"
       --proposals "${NUM_SPECULATIVE_TOKENS:-15}" --max-model-len "${MAX_MODEL_LEN:-4096}"
       --memory-fraction "${MEMORY_FRACTION:-0.8}")
 if [[ "${DRAFT_GRAPH:-0}" != 0 && "${DRAFT_GRAPH:-0}" != 1 ]]; then

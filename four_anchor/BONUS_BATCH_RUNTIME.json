@@ -1,0 +1,18 @@
+{
+  "inference_version": "bonus_addon20_draft4_batch_v1",
+  "sha256": {
+    "four_anchor/model.py": "fc2c02d4f5fa32df3236ae535bc8de9995e19ad37548e2d793d50e2bd01441de",
+    "four_anchor/data.py": "0b34933dd953824bcfeaab34d735adb9bb6803222ebfb633497a3120ce988ea9",
+    "four_anchor/inference.py": "168a4f9ac9a4277dd4b6f10ad005508eb64e57f6abc412baa22eaaec6e72ed5c",
+    "four_anchor/vllm_support.py": "20a340f0ad2ca35ad950a6ffc8f82aac6655c884a8107cd0bc07593c99d787dd",
+    "four_anchor/vllm_ascend.py": "162cf0fc45edbde82144194d76ebac80b6e79dd746cf6e5647d2cc0274563aa0",
+    "four_anchor/vllm_entry.py": "efe85454388134ec905dc8e52f7782867155d60660478679e1e60c9e8d86fa90",
+    "four_anchor/scripts/vllm_ascend.sh": "76406901bb30ef97b99d934c23fb71970e96166a287be3878f72edf6000de9ac",
+    "four_anchor/vllm_target_bonus.py": "5ebbf7f61afa3a94eeb17a0ee75c7cd800093e86369e35ed165f39b7d24ff394",
+    "four_anchor/batch_inference.py": "bc0b154ca58c4cbff589053286119e4c99042447e41fd95c900add98e12d45bc",
+    "four_anchor/vllm_batch_ascend.py": "e447a53542b957d10a69de1feaa2587d5bf6d79693b71c26119727195cbb510e",
+    "four_anchor/vllm_batch_entry.py": "35c8a8083efddcdc846bb7ffb5645213223cc13b90ee1e33681576f2da687139",
+    "four_anchor/scripts/vllm_batch_ascend.sh": "34acd3c8dcbbc1a83de8239661489bc3283c92834e7159b2ecb6d1530690d179",
+    "four_anchor/scripts/run_batched_benchmarks.py": "512ecad839bab3a941227c325c1ce26614fa451c71678686e28baf22618b11fb"
+  }
+}

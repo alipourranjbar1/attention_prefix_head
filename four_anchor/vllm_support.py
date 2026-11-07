@@ -16,6 +16,7 @@ class ServingSettings:
     trace_steps: bool = False
     profile_steps: int = 0
     draft_graph: bool = False
+    anchor_policy: str = "trained"
 
     def __post_init__(self):
         if self.profile_steps < 0:
@@ -24,6 +25,10 @@ class ServingSettings:
             raise ValueError("num_proposals must be positive")
         if self.mode not in {"two_pass", "one_pass"}:
             raise ValueError("mode must be two_pass or one_pass")
+        if self.anchor_policy not in {"trained", "accepted_prefix", "bonus_addon"}:
+            raise ValueError("Unknown anchor_policy")
+        if self.anchor_policy == "accepted_prefix" and self.mode != "two_pass":
+            raise ValueError("accepted_prefix requires two_pass")
 
     def metadata(self):
         path = Path(self.checkpoint)
@@ -34,6 +39,8 @@ class ServingSettings:
         if cfg["num_anchors"] != 4:
             raise ValueError("This adapter requires four conditioning anchors")
         layout = cfg.get("anchor_layout", "past")
+        if self.anchor_policy in {"accepted_prefix", "bonus_addon"} and layout != "target_four":
+            raise ValueError(f"{self.anchor_policy} requires a format-3 target_four checkpoint")
         if layout in {"bonus_in_four", "target_four"}:
             version = 3 if layout == "target_four" else 2
             if (cfg.get("format_version"), cfg["num_proposals"], self.num_proposals) != (version, 15, 15):
@@ -48,6 +55,10 @@ class ServingSettings:
 
     def inference_version(self):
         layout = self.metadata()["draft_config"].get("anchor_layout", "past")
+        if self.anchor_policy == "bonus_addon":
+            return "bonus_addon20_draft4_v1"
+        if self.anchor_policy == "accepted_prefix":
+            return "accepted_prefix19_v1"
         return {"past": "known_bonus_cached_v1", "bonus_in_four": "bonus_in_four_cached_v2",
                 "target_four": "target_four_materialized_v3"}[layout]
 
