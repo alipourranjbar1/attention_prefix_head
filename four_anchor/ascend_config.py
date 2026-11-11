@@ -48,6 +48,8 @@ def build_config(env):
         train_data_ratio=float(env.get("TRAIN_DATA_RATIO", "0.9")),
         num_workers=int(env.get("NUM_WORKERS", "4")),
         loss_fn=json.loads(env.get("LOSS_FN", '{"ce":0.1,"tv":0.9}')),
+        anchor_layout=env.get("ANCHOR_LAYOUT", "past"),
+        epoch_benchmark_dir=env.get("EPOCH_BENCHMARK_DIR") or None,
     )
     if config.distributed_strategy == "fsdp" and len(train_devices) < 2:
         raise ValueError("FSDP requires at least two TRAIN_NPUS")
@@ -61,13 +63,16 @@ if __name__ == "__main__":
     (out / "train_config.json").write_text(json.dumps(asdict(cfg), indent=2) + "\n")
     settings = {"target_npus": os.environ["TARGET_NPUS"], "train_npus": os.environ["TRAIN_NPUS"],
                 "conditioning_anchors": 4, "new_tokens_per_pass": cfg.num_proposals,
-                "query_positions": 4 + cfg.num_proposals, "max_blocks_per_packed_batch": cfg.max_anchors,
+                "query_positions": ({"round_one": 20, "round_two": 19} if cfg.anchor_layout == "bonus_addon"
+                                    else 4 + cfg.num_proposals), "max_blocks_per_packed_batch": cfg.max_anchors,
                 "training_mode": cfg.training_mode, "loss_fn": cfg.loss_fn,
                 "distributed_strategy": cfg.distributed_strategy,
                 "packed_execution": cfg.packed_execution,
                 "hf_decoder_layer_ids": cfg.target_layer_ids,
                 "vllm_capture_ids": [i + 1 for i in cfg.target_layer_ids], "include_final_target_layer": True,
                 "last_layer_causal": False,
+                "anchor_layout": cfg.anchor_layout,
+                "epoch_benchmark_dir": cfg.epoch_benchmark_dir,
                 "model": cfg.target, "dataset": cfg.data, "epochs": cfg.epochs,
                 "learning_rate": cfg.learning_rate, "sequence_length": cfg.max_sequence_length}
     (out / "launch_settings.json").write_text(json.dumps(settings, indent=2) + "\n")

@@ -21,7 +21,7 @@ from .runtime import resolve_device
 from .train import TrainConfig
 
 
-def run_check(device, output, dtype="bfloat16", packed_execution="cached"):
+def run_check(device, output, dtype="bfloat16", packed_execution="cached", anchor_layout="past", draft_type="dflash", loss_graph="off", head_loss_backend="checkpoint"):
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.manual_seed(193)
     # Keep a conventional accelerator attention head size (128), while making
@@ -31,15 +31,29 @@ def run_check(device, output, dtype="bfloat16", packed_execution="cached"):
                         max_position_embeddings=128, eos_token_id=None, pad_token_id=0)
     config._attn_implementation = "sdpa"
     target = Qwen3ForCausalLM(config).to(device=device, dtype=getattr(torch, dtype)).eval().requires_grad_(False)
-    draft = FourAnchorDFlash(DraftConfig("fsdp-preflight", [0, 1], 63, num_draft_layers=2, num_proposals=4), target)
+    draft_config_class, model_class, train_config_class = DraftConfig, FourAnchorDFlash, TrainConfig
+    extra = {}
+    if draft_type == "dspark":
+        from .dspark_model import DSparkDraftConfig, FourAnchorDSpark
+        from .dspark_train import DSparkTrainConfig
+        draft_config_class, model_class, train_config_class = DSparkDraftConfig, FourAnchorDSpark, DSparkTrainConfig
+        anchor_layout = "bonus_addon"
+        extra = {"markov_rank": 4}
+    proposals = 15 if anchor_layout != "past" else 4
+    draft = model_class(draft_config_class("fsdp-preflight", [0, 1], 63, num_draft_layers=2, num_proposals=proposals,
+                                       anchor_layout=anchor_layout,
+                                       format_version={"past": 1, "bonus_in_four": 2, "target_four": 3, "bonus_addon": 4}[anchor_layout], **extra), target)
     for p in draft.parameters():
         if p.requires_grad:
             p.data = p.data.float()
     draft.gradient_checkpointing = True
-    cfg = TrainConfig("fsdp-preflight", "synthetic", str(output), 63, [0, 1], device=str(device), dtype=dtype,
+    draft.loss_graph = loss_graph
+    draft.head_loss_backend = head_loss_backend
+    cfg = train_config_class("fsdp-preflight", "synthetic", str(output), 63, [0, 1], device=str(device), dtype=dtype,
                       training_mode="packed", distributed_strategy="fsdp", epochs=1, num_workers=0,
-                      num_proposals=4, max_anchors=16, blocks_per_chunk=2, head_chunk_size=7,
-                      max_sequence_length=32, loss_fn={"ce": .1, "tv": .9}, packed_execution=packed_execution)
+                      num_proposals=proposals, max_anchors=16, blocks_per_chunk=2, head_chunk_size=7,
+                      anchor_layout=anchor_layout,
+                      max_sequence_length=32, loss_fn={"ce": .1, "tv": .9}, packed_execution=packed_execution, **extra)
     task = PackedTask(draft, target.model.norm, cfg, random.Random(321 + rank)).train()
     full_elements = sum(p.numel() for p in draft.parameters() if p.requires_grad)
     wrapped = wrap_task(task, "fsdp", device, dtype, world)
@@ -83,8 +97,10 @@ def run_check(device, output, dtype="bfloat16", packed_execution="cached"):
     expected, _ = checkpoint_states(wrapped, draft, optimizer)
     del optimizer, wrapped, task, draft
 
-    restored = FourAnchorDFlash.load(output, target, trainable_dtype=torch.float32)
+    restored = model_class.load(output, target, trainable_dtype=torch.float32)
     restored.gradient_checkpointing = True
+    restored.loss_graph = loss_graph
+    restored.head_loss_backend = head_loss_backend
     task2 = PackedTask(restored, target.model.norm, cfg, random.Random()).train()
     task2.rng.setstate(rng_state)
     wrapped2 = wrap_task(task2, "fsdp", device, dtype, world)
@@ -97,7 +113,7 @@ def run_check(device, output, dtype="bfloat16", packed_execution="cached"):
         assert actual.keys() == expected.keys()
         for key in actual:
             torch.testing.assert_close(actual[key], expected[key], atol=1e-6, rtol=1e-5, msg=key)
-        result = {"status": "passed", "world_size": world, "device": str(device), "dtype": dtype,
+        result = {"status": "passed", "world_size": world, "device": str(device), "dtype": dtype, "draft_type": draft_type,
                   "sharding": "FULL_SHARD" if world > 1 else "NO_SHARD (single-rank unit test)",
                   "rank0_trainable_elements": local_elements, "full_trainable_elements": full_elements,
                   "first_global_grad_norm": norm, "checkpoint_continuation": "matched", "packed_execution": packed_execution}
@@ -112,12 +128,16 @@ def main():
     parser.add_argument("--output", required=True)
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="bfloat16")
     parser.add_argument("--packed-execution", choices=["reference", "cached"], default="cached")
+    parser.add_argument("--anchor-layout", choices=["past", "bonus_in_four", "target_four", "bonus_addon"], default="past")
+    parser.add_argument("--loss-graph", choices=["off", "npu"], default="off")
+    parser.add_argument("--draft-type", choices=["dflash", "dspark"], default="dflash")
+    parser.add_argument("--head-loss-backend", choices=["checkpoint", "cached_vjp"], default="checkpoint")
     args = parser.parse_args()
     device = resolve_device(f"{args.device}:{os.environ.get('LOCAL_RANK', '0')}" if args.device != "cpu" else "cpu")
     dist.init_process_group(backend={"npu": "hccl", "cuda": "nccl"}.get(device.type, "gloo"),
                             timeout=timedelta(seconds=180))
     try:
-        run_check(device, args.output, args.dtype, args.packed_execution)
+        run_check(device, args.output, args.dtype, args.packed_execution, args.anchor_layout, args.draft_type, args.loss_graph, args.head_loss_backend)
     finally:
         dist.destroy_process_group()
 

@@ -24,7 +24,8 @@ def engine_options(args):
         settings = ServingSettings(str(Path(args.checkpoint).resolve()), args.proposals, args.mode,
                                    trace_steps=getattr(args, "trace_steps", False),
                                    profile_steps=getattr(args, "profile_steps", 0),
-                                   draft_graph=getattr(args, "draft_graph", False))
+                                   draft_graph=getattr(args, "draft_graph", False),
+                                   anchor_policy=getattr(args, "anchor_policy", "trained"))
         settings.metadata()
         options.update(
             worker_cls="four_anchor.vllm_ascend.FourAnchorWorker",
@@ -63,6 +64,15 @@ def summarize(rows):
             "acceptance_note": "vLLM verification accounting, before EOS/output-budget truncation; anchors excluded"}
 
 
+def worker_counters(llm):
+    values = llm.collective_rpc("four_anchor_counters")
+    if len(values) != 1 or set(values[0]) != {"extra_target_forwards", "bonus_page_fallbacks"}:
+        raise RuntimeError("Expected counters from exactly one four-anchor worker")
+    if any(type(v) is not int or v < 0 for v in values[0].values()):
+        raise RuntimeError("Invalid target-forward counters")
+    return values[0]
+
+
 def evaluate(args, options):
     from transformers import AutoTokenizer
     from tqdm import tqdm
@@ -90,12 +100,20 @@ def evaluate(args, options):
     if (output / "per_prompt.jsonl").exists():
         raise ValueError("Use a fresh OUTPUT_DIR; per_prompt.jsonl already exists")
     (output / "engine_config.json").write_text(json.dumps(options, indent=2) + "\n")
+    version = (ServingSettings(args.checkpoint, args.proposals, args.mode,
+                              anchor_policy=getattr(args, "anchor_policy", "trained")).inference_version()
+               if args.mode != "ar" else "ar")
     llm = LLM(**options)
     params = SamplingParams(temperature=0, max_tokens=args.max_new_tokens, seed=42,
                             repetition_penalty=1, presence_penalty=0, frequency_penalty=0)
     for _ in range(args.warmup):
         llm.generate([{"prompt_token_ids": prompts[0]}],
                      SamplingParams(temperature=0, max_tokens=min(32, args.max_new_tokens)), use_tqdm=False)
+    counted_versions = {"target_four_materialized_v3", "accepted_prefix19_v1", "bonus_addon20_draft4_v1"}
+    no_extra_versions = {"accepted_prefix19_v1", "bonus_addon20_draft4_v1"}
+    counters = worker_counters(llm) if version in counted_versions else None
+    if version in no_extra_versions and any(counters.values()):
+        raise RuntimeError("Cached inference unexpectedly made an extra target forward during warmup")
     rows = []
     with (output / "per_prompt.jsonl").open("x") as stream:
         for i, prompt in enumerate(tqdm(prompts, desc=f"vLLM {args.mode}", unit="prompt")):
@@ -115,6 +133,15 @@ def evaluate(args, options):
                    "token_ids": list(result.token_ids), "output_tokens": len(result.token_ids),
                    "seconds": seconds, "tokens_per_second": len(result.token_ids) / max(seconds, 1e-9),
                    "speculative_decoding": metrics}
+            if counters is not None:
+                after = worker_counters(llm)  # after the timed generate call
+                delta = {key: after[key] - counters[key] for key in counters}
+                if any(v < 0 for v in delta.values()):
+                    raise RuntimeError("Worker counters reset during evaluation")
+                if version in no_extra_versions and any(delta.values()):
+                    raise RuntimeError("Cached inference unexpectedly made an extra target forward")
+                row.update(delta)
+                counters = after
             if baseline is not None:
                 row["matches_greedy_target"] = row["token_ids"] == baseline[i]["token_ids"]
             stream.write(json.dumps(row) + "\n")
@@ -122,11 +149,33 @@ def evaluate(args, options):
             rows.append(row)
             print(json.dumps({k: v for k, v in row.items() if k not in {"prompt_token_ids", "token_ids"}}), flush=True)
     summary = summarize(rows)
-    summary.update(draft_graph=getattr(args, "draft_graph", False) and args.mode != "ar", inference_version="known_bonus_cached_v1", extra_target_forwards=0,
+    summary.update(draft_graph=getattr(args, "draft_graph", False) and args.mode != "ar", inference_version=version,
+                   extra_target_forwards=sum(r.get("extra_target_forwards", 0) for r in rows),
+                   bonus_page_fallbacks=sum(r.get("bonus_page_fallbacks", 0) for r in rows),
                    profiling_enabled=getattr(args, "profile_steps", 0) > 0,
                    mode=args.mode, conditioning_anchors=4 if args.mode != "ar" else 0,
                    speculative_tokens=args.proposals if args.mode != "ar" else 0,
                    parity_checked=baseline is not None)
+    if version == "target_four_materialized_v3":
+        if summary["extra_target_forwards"] < summary["verification_cycles"]:
+            raise RuntimeError("Target-state drafting is missing its bonus-forward accounting")
+        summary["acceptance_note"] += "; bonus-materialization forwards are additional and excluded from verification-cycle denominator"
+        summary["query_positions"] = 19
+        summary["first_round_target_anchor_states"] = 4
+    if version == "accepted_prefix19_v1":
+        summary.update(query_positions=19, first_round_target_anchor_states=4,
+                       anchor_policy="accepted_prefix", bonus_target_forward_required=False,
+                       first_round_anchor_end="last_processed_token",
+                       redraft_generated_anchor_features="first_pass_drafter",
+                       extra_target_forwards_measured=True)
+    if version == "bonus_addon20_draft4_v1":
+        summary.update(query_positions={"round_one": 20, "round_two": 19},
+                       verification_block_size=16, first_round_target_anchor_states=4,
+                       first_round_bonus_input="embedding_only", anchor_policy="bonus_addon",
+                       second_round_anchor_states="four_first_pass_drafter_states",
+                       second_round_extra_bonus_slots=0, bonus_target_forward_required=False,
+                       first_round_anchor_end="last_processed_token",
+                       extra_target_forwards_measured=True)
     if baseline is not None:
         summary["matching_prompts"] = sum(r["matches_greedy_target"] for r in rows)
         summary["all_match_greedy_target"] = all(r["matches_greedy_target"] for r in rows)
@@ -147,6 +196,7 @@ def main(argv=None):
     parser.add_argument("--checkpoint")
     parser.add_argument("--mode", choices=["ar", "one_pass", "two_pass"], default="two_pass")
     parser.add_argument("--proposals", type=int, default=15)
+    parser.add_argument("--anchor-policy", choices=["trained", "accepted_prefix", "bonus_addon"], default="trained")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--memory-fraction", type=float, default=0.8)
     parser.add_argument("--host", default="127.0.0.1")

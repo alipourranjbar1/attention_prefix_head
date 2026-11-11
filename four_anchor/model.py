@@ -29,6 +29,7 @@ class DraftConfig:
     attention: str = "sdpa"
     target_revision: str | None = None
     format_version: int = 1
+    anchor_layout: str = "past"
 
     def __post_init__(self):
         if self.num_anchors < 1 or self.num_proposals < 1 or self.num_draft_layers < 1:
@@ -37,8 +38,21 @@ class DraftConfig:
             raise ValueError("target_layer_ids must be a nonempty list of distinct decoder indices")
         if self.attention not in {"sdpa", "eager"}:
             raise ValueError("This reference backend supports sdpa and eager attention")
-        if self.format_version != 1:
+        if self.format_version not in {1, 2, 3, 4}:
             raise ValueError("Unsupported four-anchor checkpoint version")
+        if self.anchor_layout not in {"past", "bonus_in_four", "target_four", "bonus_addon"}:
+            raise ValueError("Unknown anchor_layout")
+        if self.anchor_layout == "bonus_in_four":
+            if (self.format_version, self.num_anchors, self.num_proposals) != (2, 4, 15):
+                raise ValueError("bonus_in_four requires format_version=2, four anchors and 15 proposals")
+        elif self.anchor_layout == "target_four":
+            if (self.format_version, self.num_anchors, self.num_proposals) != (3, 4, 15):
+                raise ValueError("target_four requires format_version=3, four target anchors and 15 proposals")
+        elif self.anchor_layout == "bonus_addon":
+            if (self.format_version, self.num_anchors, self.num_proposals) != (4, 4, 15):
+                raise ValueError("bonus_addon requires format_version=4, four anchors and 15 proposals")
+        elif self.format_version != 1:
+            raise ValueError("Legacy past-anchor checkpoints use format_version=1")
 
 
 @dataclass
@@ -47,7 +61,7 @@ class Anchors:
     positions: torch.Tensor       # [1, A], original absolute positions
     target_features: torch.Tensor # [1, A, F]
     draft_features: torch.Tensor  # [1, A, H]
-    source: torch.Tensor          # [1, A]: 0=padding, 1=target, 2=first-pass drafter
+    source: torch.Tensor          # [1, A]: 0=padding, 1=target, 2=draft, 3=embedding-only bonus
 
 
 @dataclass
@@ -112,6 +126,9 @@ def make_anchors(prefix_ids, target_features, num_anchors, hidden_size,
 
 
 class FourAnchorDFlash(nn.Module):
+    checkpoint_architecture = "FourAnchorDFlash"
+    config_class = DraftConfig
+
     def __init__(self, cfg: DraftConfig, target):
         super().__init__()
         self.cfg = cfg
@@ -158,6 +175,8 @@ class FourAnchorDFlash(nn.Module):
         return {k: getattr(tc, k, None) for k in keys}
 
     def forward(self, context_features, anchors: Anchors, start: int) -> DraftOutput:
+        if self.cfg.anchor_layout == "bonus_addon":
+            raise ValueError("bonus_addon requires the packed training path or bonus-addon vLLM proposer")
         a, m = self.cfg.num_anchors, self.cfg.num_proposals
         if anchors.ids.shape != (1, a) or context_features.shape[0] != 1:
             raise ValueError("Each reference pass needs one sequence and exactly num_anchors slots")
@@ -197,7 +216,7 @@ class FourAnchorDFlash(nn.Module):
     def save(self, path, state_dict=None):
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        metadata = {"architecture": "FourAnchorDFlash", "draft_config": asdict(self.cfg),
+        metadata = {"architecture": self.checkpoint_architecture, "draft_config": asdict(self.cfg),
                     "target_signature": self.target_signature}
         (path / "four_anchor_config.json").write_text(json.dumps(metadata, indent=2) + "\n")
         source = self.state_dict() if state_dict is None else state_dict
@@ -206,33 +225,46 @@ class FourAnchorDFlash(nn.Module):
         save_file(state, str(path / "model.safetensors"))
 
     def packed_hidden(self, features, context_positions, document_ids, anchors,
-                      starts, context_limits, block_documents, memory=None):
+                      starts, context_limits, block_documents, memory=None, include_bonus=False,
+                      bonus_ids=None, return_all=False):
         """Independent blocks sharing packed context memory; no cross-document KV.
 
         starts/context_limits are *document-relative* positions. Pass two moves
         starts, but keeps the original context_limits: teacher states of the
         retained proposals must never leak into either its queries or memory.
         Returns [blocks, proposals, H], before the frozen vocabulary projection.
+        bonus_ids adds ONE embedding-only query at starts-1; it is not a fifth
+        target anchor. return_all retains all query states for draft-only redrafting.
         """
         a, m = self.cfg.num_anchors, self.cfg.num_proposals
         g = starts.numel()
         device = features.device
         masked = torch.full((g, m), self.cfg.mask_token_id, device=device, dtype=torch.long)
-        x = self.embed_tokens(torch.cat([anchors.ids, masked], -1))
+        if bonus_ids is not None:
+            if self.cfg.anchor_layout != "bonus_addon" or include_bonus or bonus_ids.shape != (g, 1):
+                raise ValueError("The addon layout needs one bonus ID per block")
+            if not torch.equal(context_limits, starts - 1):
+                raise ValueError("Bonus and future target states must remain outside context")
+        slots = masked if bonus_ids is None else torch.cat((bonus_ids, masked), -1)
+        q = a + slots.shape[1]
+        x = self.embed_tokens(torch.cat([anchors.ids, slots], -1))
         tf = self.hidden_norm(self.fc(anchors.target_features))
         df = self.draft_anchor_norm(self.draft_anchor_proj(anchors.draft_features))
         feature = tf * (anchors.source == 1)[..., None] + df * (anchors.source == 2)[..., None]
-        x = (x + torch.cat([feature, torch.zeros_like(x[:, a:])], 1)).reshape(1, g * (a + m), -1)
+        x = (x + torch.cat([feature, torch.zeros_like(x[:, a:])], 1)).reshape(1, g * q, -1)
         context = self.hidden_norm(self.fc(features)) if memory is None else None
-        query_positions = torch.cat([anchors.positions, starts[:, None] + torch.arange(m, device=device)], -1)
+        slot_positions = starts[:, None] + torch.arange(m, device=device)
+        if bonus_ids is not None:
+            slot_positions = torch.cat((starts[:, None] - 1, slot_positions), -1)
+        query_positions = torch.cat([anchors.positions, slot_positions], -1)
         positions = torch.cat([context_positions[None], query_positions.reshape(1, -1)], -1)
         rope = self.rotary_emb(x, positions)
         ctx_ok = ((document_ids[None] == block_documents[:, None]) &
                   (context_positions[None] < context_limits[:, None]))
-        owners = torch.arange(g, device=device).repeat_interleave(a + m)
-        key_valid = torch.cat([anchors.source != 0, torch.ones_like(masked, dtype=torch.bool)], -1).flatten()
+        owners = torch.arange(g, device=device).repeat_interleave(q)
+        key_valid = torch.cat([anchors.source != 0, torch.ones_like(slots, dtype=torch.bool)], -1).flatten()
         query_ok = (owners[:, None] == owners[None]) & key_valid[None]
-        allowed = torch.cat([ctx_ok.repeat_interleave(a + m, 0), query_ok], -1)
+        allowed = torch.cat([ctx_ok.repeat_interleave(q, 0), query_ok], -1)
         mask = torch.zeros((1, 1, *allowed.shape), device=device, dtype=x.dtype)
         mask.masked_fill_(~allowed[None, None], torch.finfo(x.dtype).min)
         for index, layer in enumerate(self.layers):
@@ -250,7 +282,12 @@ class FourAnchorDFlash(nn.Module):
                 x = checkpoint(run, *args, use_reentrant=False)
             else:
                 x = run(*args)
-        return self.norm(x.reshape(g, a + m, -1)[:, a:])
+        # The last anchor's first-pass state conditions the next pass. It is
+        # NOT a target state and is never supervised as a speculative token.
+        hidden = self.norm(x.reshape(g, q, -1))
+        if return_all:
+            return hidden
+        return hidden[:, a + int(bonus_ids is not None) - int(include_bonus):]
 
     def packed_memory(self, features, positions):
         """Project shared context and each layer's K/V once, with gradients intact."""
@@ -300,11 +337,11 @@ class FourAnchorDFlash(nn.Module):
     def load(cls, path, target, trainable_dtype=None):
         path = Path(path)
         metadata = json.loads((path / "four_anchor_config.json").read_text())
-        if metadata["architecture"] != "FourAnchorDFlash":
-            raise ValueError("Not a FourAnchorDFlash checkpoint")
+        if metadata["architecture"] != cls.checkpoint_architecture:
+            raise ValueError(f"Not a {cls.checkpoint_architecture} checkpoint")
         if metadata["target_signature"] != cls.signature(target.config):
             raise ValueError("Checkpoint and target architectures differ")
-        model = cls(DraftConfig(**metadata["draft_config"]), target)
+        model = cls(cls.config_class(**metadata["draft_config"]), target)
         # Resume must not round saved FP32 master weights through the frozen
         # target's BF16 dtype before the optimizer is restored.
         if trainable_dtype is not None:

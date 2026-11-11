@@ -17,7 +17,8 @@ from .data import load_records, filter_training_records
 
 def prepare_records(cfg):
     cache = Path(cfg.data_cache_dir or Path(cfg.output) / ".data_cache")
-    data, summary = filter_training_records(load_records(cfg.data, cfg.split), cfg.max_sequence_length, cache)
+    data, summary = filter_training_records(load_records(cfg.data, cfg.split), cfg.max_sequence_length, cache,
+                                            min_start=2 if cfg.anchor_layout in {"bonus_in_four", "bonus_addon"} else 1)
     if cfg.train_data_ratio < 1:
         split = data.train_test_split(train_size=cfg.train_data_ratio, seed=cfg.seed)
         data = split["train"]

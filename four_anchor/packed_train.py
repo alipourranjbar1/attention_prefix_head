@@ -27,13 +27,21 @@ def metric_row(metrics):
     ce1, tv1, kl1, w1 = values[2:6]
     ce2, tv2, kl2, w2 = values[6:10]
     kept, predicted, blocks = values[10:13]
-    return {"loss": num / max(den, 1e-8),
+    row = {"loss": num / max(den, 1e-8),
             "first_ce": ce1 / max(w1, 1e-8), "first_tv": tv1 / max(w1, 1e-8),
             "first_kl": kl1 / max(w1, 1e-8),
             "second_ce": ce2 / max(w2, 1e-8), "second_tv": tv2 / max(w2, 1e-8),
             "second_kl": kl2 / max(w2, 1e-8),
             "boundary_mean": kept / max(blocks, 1), "predicted_boundary_mean": predicted / max(blocks, 1),
             "training_blocks": blocks}
+    # DSpark adds two confidence statistics per round before the final
+    # redraft counter appended by the common training loop.
+    if len(values) >= 17:
+        row.update(first_confidence_bce=values[13] / max(w1, 1e-8),
+                   first_confidence_mae=values[14] / max(w1, 1e-8),
+                   second_confidence_bce=values[15] / max(w2, 1e-8),
+                   second_confidence_mae=values[16] / max(w2, 1e-8))
+    return row
 
 
 def memory_metrics(device):
@@ -48,6 +56,11 @@ def memory_metrics(device):
 
 def train_packed(cfg):
     from .train import TrainConfig, _rng_state, _restore_rng
+    dspark = getattr(cfg, "draft_type", "dflash") == "dspark"
+    config_class, model_class = DraftConfig, FourAnchorDFlash
+    if dspark:
+        from .dspark_model import DSparkDraftConfig, FourAnchorDSpark
+        config_class, model_class = DSparkDraftConfig, FourAnchorDSpark
     world, rank, local_rank = (int(os.environ.get(k, d)) for k, d in
                                [("WORLD_SIZE", "1"), ("RANK", "0"), ("LOCAL_RANK", "0")])
     if cfg.distributed_strategy == "fsdp" and world < 2:
@@ -81,14 +94,21 @@ def train_packed(cfg):
         target_norm = target.model.norm
     if cfg.max_sequence_length + 2 * cfg.num_proposals > target.config.max_position_embeddings:
         raise ValueError("Target context window must allow two proposal blocks beyond the sequence length")
-    draft_cfg = DraftConfig(cfg.target, cfg.target_layer_ids, cfg.mask_token_id, cfg.num_draft_layers,
-                            cfg.num_anchors, cfg.num_proposals, cfg.attention, cfg.target_revision)
-    draft = FourAnchorDFlash.load(cfg.resume, target, trainable_dtype=torch.float32) if cfg.resume else FourAnchorDFlash(draft_cfg, target)
+    extra = {"markov_rank": cfg.markov_rank} if dspark else {}
+    draft_cfg = config_class(cfg.target, cfg.target_layer_ids, cfg.mask_token_id, cfg.num_draft_layers,
+                            cfg.num_anchors, cfg.num_proposals, cfg.attention, cfg.target_revision,
+                            format_version={"past": 1, "bonus_in_four": 2, "target_four": 3, "bonus_addon": 4}[cfg.anchor_layout],
+                            anchor_layout=cfg.anchor_layout, **extra)
+    draft = model_class.load(cfg.resume, target, trainable_dtype=torch.float32) if cfg.resume else model_class(draft_cfg, target)
     if asdict(draft.cfg) != asdict(draft_cfg):
         raise ValueError("Resume model configuration differs")
     if cfg.initialize_dflash:
         draft.initialize_regular_dflash(cfg.initialize_dflash)
     draft.gradient_checkpointing = cfg.gradient_checkpointing
+    if dspark:
+        draft.loss_graph = cfg.loss_graph
+        draft.head_loss_backend = cfg.head_loss_backend
+        draft.proposal_base_batched = cfg.proposal_base_batched
     for parameter in draft.parameters():
         if parameter.requires_grad:
             parameter.data = parameter.data.float()
@@ -105,10 +125,11 @@ def train_packed(cfg):
         if world > 1:
             dist.broadcast_object_list(metadata, src=0, device=device)
         state = metadata[0]
-        previous = asdict(TrainConfig(**state["train_config"]))
+        previous = asdict(type(cfg)(**state["train_config"]))
         operational = {"output", "resume", "initialize_dflash", "device", "checkpoint_every", "log_every",
                        "max_steps", "tensorboard", "vllm_endpoint", "hidden_states_dir", "data_cache_dir",
-                       "progress", "num_workers", "profile_steps"}
+                       "progress", "num_workers", "profile_steps", "epoch_benchmark_dir", "loss_graph",
+                       "head_loss_backend", "gradient_checkpointing", "proposal_base_batched"}
         changes = [k for k, v in previous.items() if k not in operational and asdict(cfg)[k] != v]
         if changes or previous["training_mode"] != "packed":
             raise ValueError(f"Resume recipe differs: {changes}; use a fresh run for the packed objective")
@@ -130,6 +151,14 @@ def train_packed(cfg):
     if rank == 0:
         output.mkdir(parents=True, exist_ok=True)
         record(output, "train", settings)
+        if dspark:
+            # Newly installed port files may not yet be committed. Capture
+            # their contents as well as the normal provenance hashes/diff.
+            from zipfile import ZipFile, ZIP_DEFLATED
+            source_root = Path(__file__).resolve().parent
+            with ZipFile(output / "dspark_sources.zip", "w", ZIP_DEFLATED) as archive:
+                for source in sorted(source_root.rglob("*.py")):
+                    archive.write(source, str(Path("four_anchor") / source.relative_to(source_root)))
         (output / "train_config.json").write_text(json.dumps(asdict(cfg), indent=2) + "\n")
         print(json.dumps({"event": "packed_training_start", **settings}), flush=True)
     if world > 1:
@@ -137,7 +166,8 @@ def train_packed(cfg):
     writer = None
     if rank == 0 and cfg.tensorboard:
         from torch.utils.tensorboard import SummaryWriter
-        writer = SummaryWriter(str(output / "logs/four_anchor_dflash"), purge_step=step if cfg.resume else None)
+        writer = SummaryWriter(str(output / ("logs/four_anchor_dspark" if dspark else "logs/four_anchor_dflash")),
+                               purge_step=step if cfg.resume else None)
     records = TeacherRecords(data, cfg, target.config, runner)
     initial_step, started = step, time.monotonic()
     saved = str(Path(cfg.resume)) if cfg.resume else None
@@ -162,6 +192,9 @@ def train_packed(cfg):
             dist.barrier()
         if rank == 0:
             (output / "latest_checkpoint.txt").write_text(str(path.resolve()) + "\n")
+            if cfg.epoch_benchmark_dir and batch_offset == 0 and next_epoch > 0:
+                from .epoch_benchmarks import publish_epoch
+                publish_epoch(cfg.epoch_benchmark_dir, path, next_epoch, step)
         saved = str(path)
 
     try:
@@ -186,6 +219,7 @@ def train_packed(cfg):
                             mininterval=1, disable=rank != 0 or not cfg.progress)
             try:
                 while offset < len(batches) and step < stop_step:
+                    step_tick = time.perf_counter()
                     profile = step - initial_step < cfg.profile_steps
                     phase_times = [0., 0., 0., 0.]
                     redraft_blocks = 0
@@ -198,7 +232,7 @@ def train_packed(cfg):
                                                           max(1, total_steps - cfg.warmup_steps)))
                     for group in optimizer.param_groups:
                         group["lr"] = cfg.learning_rate * multiplier
-                    metrics = torch.zeros(13, device=device)
+                    metrics = torch.zeros(17 if dspark else 13, device=device)
                     for micro in range(accumulation):
                         if profile:
                             synchronize(device)
@@ -247,18 +281,24 @@ def train_packed(cfg):
                     row = {"step": step, "total_steps": total_steps, "epoch": epoch + 1,
                            "step_in_epoch": math.ceil(offset / cfg.gradient_accumulation),
                            "steps_in_epoch": counts[epoch], **metric_row(metrics),
-                           "redraft_blocks_computed": metrics[13].item(),
+                           "redraft_blocks_computed": metrics[-1].item(),
                            "learning_rate": optimizer.param_groups[0]["lr"], "grad_norm": float(grad_norm),
                            "estimated_remaining_seconds": elapsed / (step - initial_step) * (total_steps - step)}
-                    if cfg.packed_execution == "cached" and not (cfg.loss_fn or {}).get("kl_div", 0):
+                    if (cfg.packed_execution == "cached" or cfg.anchor_layout in {"bonus_in_four", "bonus_addon"}) and not (cfg.loss_fn or {}).get("kl_div", 0):
                         row.pop("first_kl")
                         row.pop("second_kl")
                     if profile:
                         times = torch.tensor(phase_times, device=device)
+                        step_time = torch.tensor(time.perf_counter() - step_tick, device=device)
                         if world > 1:
                             dist.all_reduce(times, op=dist.ReduceOp.MAX)
+                            dist.all_reduce(step_time, op=dist.ReduceOp.MAX)
+                        row["max_rank_step_seconds"] = step_time.item()
                         row.update(dict(zip(("max_rank_input_seconds", "max_rank_forward_seconds",
                                              "max_rank_backward_seconds", "max_rank_optimizer_seconds"), times.tolist())))
+                    if dspark and cfg.loss_graph == "npu":
+                        from .dspark_loss_graph import graph_status
+                        row.update(graph_status())
                     if rank == 0 and (step % cfg.log_every == 0 or profile):
                         row.update(memory_metrics(device))
                         progress.write(json.dumps(row))
@@ -269,7 +309,7 @@ def train_packed(cfg):
                                 writer.add_scalar("train/" + key, value, step)
                     epoch_end = offset == len(batches)
                     periodic = epoch_end if cfg.checkpoint_each_epoch else step % cfg.checkpoint_every == 0
-                    if periodic or step == stop_step:
+                    if (periodic or step == stop_step) and not getattr(cfg, "benchmark_only", False):
                         save(epoch + int(epoch_end), 0 if epoch_end else offset)
                     progress.set_postfix(loss=f"{row['loss']:.4f}", global_step=f"{step}/{total_steps}",
                                          total_eta_h=f"{row['estimated_remaining_seconds'] / 3600:.2f}", refresh=False)

@@ -1,0 +1,42 @@
+{
+  "cpu_tests_passed": 170,
+  "cpu_source_tests": 166,
+  "installer_isolation_tests": 4,
+  "python_syntax": "passed",
+  "bash_syntax": "passed",
+  "fp32_value_gradient_agreement": "passed",
+  "bf16_value_gradient_checks": "passed within documented tolerances",
+  "fsdp_cpu_check": "world-size 1 fake-process-group API and checkpoint continuation; not HCCL",
+  "standalone_device_gradient_check": {
+    "status": "passed",
+    "device": "cpu",
+    "checks": [
+      {
+        "parameter_dtype": "torch.float32",
+        "gradient_relative_l2_errors": {
+          "hidden": 0.0,
+          "markov_head.markov_w1.weight": 0.0,
+          "markov_head.markov_w2.weight": 0.0,
+          "confidence_head.proj.weight": 0.0,
+          "confidence_head.proj.bias": 0.0
+        }
+      },
+      {
+        "parameter_dtype": "torch.bfloat16",
+        "gradient_relative_l2_errors": {
+          "hidden": 0.0,
+          "markov_head.markov_w1.weight": 0.0,
+          "markov_head.markov_w2.weight": 0.0028964667581021786,
+          "confidence_head.proj.weight": 0.004024109803140163,
+          "confidence_head.proj.bias": 0.0
+        }
+      }
+    ],
+    "note": "BF16 tolerance test, not bitwise equality or a throughput benchmark"
+  },
+  "npu_executed": false,
+  "npu_performance_measured": false,
+  "target_graph_replay_tested": false,
+  "same_training_recipe": true,
+  "hardware_trials": "nine 24-step runs; first 8 steps excluded; all NPUs must be free"
+}

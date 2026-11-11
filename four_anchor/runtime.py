@@ -187,6 +187,8 @@ class Decoder:
             raise ValueError("mode must be two_pass, one_pass, or ar")
         if mode != "ar" and self.drafter is None:
             raise ValueError("Speculative generation requires a trained checkpoint")
+        if mode != "ar" and self.drafter.cfg.anchor_layout in {"bonus_in_four", "target_four"}:
+            raise ValueError("Use the vLLM evaluator for 19-position models; this legacy HF loop has different window semantics")
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be nonnegative")
         if eos_ids is None:

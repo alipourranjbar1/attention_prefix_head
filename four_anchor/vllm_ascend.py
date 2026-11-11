@@ -12,7 +12,8 @@ from vllm.v1.worker.workspace import init_workspace_manager
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.worker import NPUWorker
 
-from .inference import KnownBonusDraft
+from .inference import KnownBonusDraft, BonusInFourDraft, TargetFourDraft, AcceptedPrefixDraft, BonusAddonDraft
+from .vllm_target_bonus import materialize_bonus
 from .model import FourAnchorDFlash
 from .remote_teacher import FrozenTargetInterface
 from .vllm_support import (
@@ -38,6 +39,7 @@ class FourAnchorProposer:
             raise ValueError("vLLM captures auxiliary states in ascending layer order")
         self.model = None
         self.history = None
+        self.counters = {"extra_target_forwards": 0, "bonus_page_fallbacks": 0}
 
     def load_model(self, _vllm_target):
         # Only the frozen embedding/head are loaded here, not an HF transformer.
@@ -51,17 +53,28 @@ class FourAnchorProposer:
             len(self.layer_ids) * self.model.hidden_size,
             self.device, target.get_input_embeddings().weight.dtype,
         )
-        self.inference = KnownBonusDraft(
+        bonus_in_four = self.model.cfg.anchor_layout == "bonus_in_four"
+        target_four = self.model.cfg.anchor_layout == "target_four"
+        accepted_prefix = self.settings.anchor_policy == "accepted_prefix"
+        bonus_addon = self.settings.anchor_policy == "bonus_addon"
+        implementation = (BonusAddonDraft if bonus_addon else AcceptedPrefixDraft if accepted_prefix else TargetFourDraft if target_four else
+                          BonusInFourDraft if bonus_in_four else KnownBonusDraft)
+        self.inference = implementation(
             self.model, self.history.ids.shape[1], self.settings.num_proposals,
             profile_steps=self.settings.profile_steps, draft_graph=self.settings.draft_graph)
         print(json.dumps({"event": "four_anchor_vllm_loaded",
-                          "inference_version": "known_bonus_cached_v1",
-                          "known_bonus_slots": 1, "extra_target_forwards": 0,
+                          "inference_version": self.settings.inference_version(),
+                          "known_bonus_slots": 1,
+                          "anchor_policy": self.settings.anchor_policy,
+                          "bonus_is_anchor": (bonus_in_four or target_four) and not (accepted_prefix or bonus_addon),
+                          "bonus_target_forward_required": target_four and not (accepted_prefix or bonus_addon),
                           "context_projection_cache": True, "draft_graph": self.settings.draft_graph,
                           "trained_proposals": self.metadata["draft_config"]["num_proposals"],
                           "serving_proposals": self.settings.num_proposals,
                           "conditioning_anchors": 4,
-                          "query_positions": 4 + 1 + self.settings.num_proposals,
+                          "query_positions": ({"round_one": 20, "round_two": 19} if bonus_addon else
+                                              4 + int(not (bonus_in_four or target_four)) + self.settings.num_proposals),
+                          "redraft_anchor_features": "first_pass_drafter_all_four" if bonus_addon else "trained_source_rule",
                           "maximum_committed_per_verification": self.settings.num_proposals + 1,
                           "target_backend": "vllm-ascend",
                           "draft_backend": "pytorch-sdpa", "mode": self.settings.mode}), flush=True)
@@ -81,7 +94,8 @@ class FourAnchorProposer:
             self.inference.cache.update("profile", 0, self.history.features[:, :n])
             if self.inference.graphs is not None:
                 self.inference.graphs.prepare(self.settings.mode)
-            self.inference.propose(self.history.ids[:, :n], self.history.ids[:, :1], self.settings.mode)
+            bonus = None if getattr(self.inference, "requires_materialized_bonus", False) else self.history.ids[:, :1]
+            self.inference.propose(self.history.ids[:, :n], bonus, self.settings.mode)
         finally:
             profiler.limit = limit
             self.inference.cache.request_id, self.inference.cache.length = None, 0
@@ -159,10 +173,26 @@ class FourAnchorNPUModelRunner(NPUModelRunner):
         if n + 2 * m + 1 > self.max_model_len:
             inference.profiler.finish()
             return [[]]
-        # The correction/bonus stays pending in the normal vLLM scheduler. It
-        # enters the drafter by token embedding only, and is processed exactly
-        # once by the next regular target forward alongside the M proposals.
-        bonus = torch.tensor([[sampled[-1]]], device=self.device, dtype=torch.long)
+        if getattr(inference, "requires_materialized_bonus", False):
+            # Four same-position target anchors require h[bonus], not h[previous].
+            # Do not advance scheduler counters; it will overwrite this one KV
+            # slot in the normal verification forward on bonus + 15 candidates.
+            with inference.profiler.region("target_bonus_materialization"):
+                actual = materialize_bonus(self, sampled[-1], n, common)
+            if actual is None:
+                self.drafter.counters["bonus_page_fallbacks"] += 1
+                inference.profiler.finish()
+                return [[]]
+            bonus_ids, bonus_features = actual
+            self.drafter.counters["extra_target_forwards"] += 1
+            inference.profiler.extra_target_forwards = 1
+            with inference.profiler.region("bonus_context_cache_update"):
+                history.update(request_id, n, bonus_ids, bonus_features)
+                inference.cache.update(request_id, n, bonus_features[None])
+            n = history.length
+            bonus = None
+        else:
+            bonus = torch.tensor([[sampled[-1]]], device=self.device, dtype=torch.long)
         tokens, _boundary = inference.propose(history.ids[:, :n], bonus, self.drafter.settings.mode)
         with inference.profiler.region("proposal_to_host"):
             result = tokens.tolist()  # required by the pinned custom-class ABI
@@ -172,6 +202,10 @@ class FourAnchorNPUModelRunner(NPUModelRunner):
 
 
 class FourAnchorWorker(NPUWorker):
+    def four_anchor_counters(self):
+        """Worker RPC: actual target bonus calls, including page-boundary skips."""
+        return dict(self.model_runner.drafter.counters)
+
     def init_device(self):
         if self.use_v2_model_runner:
             raise ValueError("Set VLLM_USE_V2_MODEL_RUNNER=0 for the four-anchor adapter")

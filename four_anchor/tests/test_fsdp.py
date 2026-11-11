@@ -10,7 +10,8 @@ from four_anchor.packed_train import train_packed
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_fsdp_hooks_full_checkpoint_optimizer_conversion_and_resume_single_rank(tmp_path, dtype):
+@pytest.mark.parametrize("layout", ["past", "bonus_addon"])
+def test_fsdp_hooks_full_checkpoint_optimizer_conversion_and_resume_single_rank(tmp_path, dtype, layout):
     # No networking is permitted here. These are real FSDP module/state APIs
     # with a single-rank in-process collective backend, so NO_SHARD only.
     # The launcher executes the same check with real HCCL and FULL_SHARD.
@@ -18,7 +19,7 @@ def test_fsdp_hooks_full_checkpoint_optimizer_conversion_and_resume_single_rank(
     torch.set_num_threads(1)
     dist.init_process_group("fake", rank=0, world_size=1)
     try:
-        run_check(torch.device("cpu"), tmp_path, dtype)
+        run_check(torch.device("cpu"), tmp_path, dtype, anchor_layout=layout)
     finally:
         dist.destroy_process_group()
     result = json.loads((tmp_path / "result.json").read_text())

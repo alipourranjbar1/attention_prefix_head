@@ -6,6 +6,7 @@ import json
 import platform
 import subprocess
 import sys
+import os
 
 
 def git(*args, cwd=None):
@@ -25,6 +26,7 @@ def record(path, stage, settings):
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parents[1]
+    spec_root = Path(os.environ.get("SPECULATORS_ROOT", str(root / "speculators")))
     packages = {}
     for name in ["torch", "torch-npu", "transformers", "speculators", "datasets", "safetensors"]:
         try:
@@ -34,13 +36,13 @@ def record(path, stage, settings):
     info = {"timestamp_utc": datetime.now(timezone.utc).isoformat(), "argv": sys.argv,
             "python": platform.python_version(), "packages": packages,
             "git_sha": git("rev-parse", "HEAD", cwd=root),
-            "speculators_sha": git("rev-parse", "HEAD", cwd=root / "speculators"),
+            "speculators_sha": git("rev-parse", "HEAD", cwd=spec_root),
             "settings": settings,
             "source_sha256": {str(p.relative_to(root)): sha256(p) for p in sorted((root / "four_anchor").rglob("*.py"))}}
     (path / f"{stage}_command.json").write_text(json.dumps(info, indent=2, default=str) + "\n")
     (path / f"{stage}_command.txt").write_text(json.dumps(info, indent=2, default=str) + "\n")
     (path / f"{stage}.patch").write_text(git("diff", "HEAD", cwd=root) or "")
-    (path / "speculators.patch").write_text(git("diff", "HEAD", cwd=root / "speculators") or "")
+    (path / "speculators.patch").write_text(git("diff", "HEAD", cwd=spec_root) or "")
 
 
 def checkpoint_hashes(path):
