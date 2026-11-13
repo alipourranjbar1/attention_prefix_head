@@ -1,0 +1,38 @@
+{
+  "package": "dloop-official-ascend",
+  "description": "Unofficial Ascend port of NAVER native DFlash DLoop training",
+  "upstream_repository": "https://github.com/naver-ai/DLoop",
+  "upstream_commit": "775dedd71aa95e1d98e6780efe5c444a2a27575c",
+  "method_files_modified": false,
+  "old_project_dependencies": [],
+  "reference_training_config_imported": false,
+  "native_loss": "rollout-token CE with decay gamma=7, stage-zero/final-stage joint normalization",
+  "released_initialization": "z-lab/Qwen3-4B-DFlash-b16",
+  "platform_changes": [
+    "NPU/HCCL device dispatch",
+    "SDPA",
+    "lazy optional imports",
+    "local saved-token loader",
+    "rank-local checkpoint I/O"
+  ],
+  "validation": "46 CPU tests passed, 24 scheduler warnings in 8.73s; no Ascend/FSDP hardware validation",
+  "optional_initialization": "INIT_MODE=scratch: seeded random regular DFlash drafter; frozen pretrained target/embeddings/head retained; not the published warm-start recipe",
+  "optional_memory_adapter": "HEAD_LOSS_CHUNK_SIZE>0: full-vocabulary CE in checkpointed prediction-row chunks, same mathematical weighted loss; no carrier detach; floating reduction order may differ",
+  "optional_packing": {
+    "entrypoint": "run_packed_new_server.sh",
+    "tokens_per_rank_budget_including_padding": 9216,
+    "max_record_length": 3072,
+    "max_sampled_starts_per_rank_pack": 768,
+    "document_layout": "independent right-padded batch rows",
+    "tail_policy": "repeat at most world_size-1 packs; no dropped records",
+    "loop_rng": "uniform step-keyed stream, identical stage count across ranks",
+    "teacher": "Qwen3 backbone; unused vocabulary projection skipped",
+    "native_model_and_forward_source_files_unchanged": true,
+    "experimental_recipe_changes": [
+      "token-budget batching",
+      "batch-wide anchor quotas",
+      "loop-depth RNG stream",
+      "scratch initialization by user request"
+    ]
+  }
+}
