@@ -1,0 +1,561 @@
+--- a/scripts/train_dflash.py
++++ b/scripts/train_dflash.py
+@@ -10,6 +10,7 @@
+ import functools
+ import logging
+ import math
++import json
+ import os
+ import shutil
+ import time
+@@ -43,13 +44,17 @@
+ from specforge.optimizer import BF16Optimizer
+ from specforge.tracker import create_tracker
+ from specforge.utils import (
+-    get_last_checkpoint,
+     load_draft_init,
+     resolve_ckpt_dir,
+     write_rope_theta,
+     get_local_device,
+     print_on_rank0,
+     print_with_rank,
++)
++
++from ascend_support.checkpoints import (
++    get_last_complete_checkpoint as get_last_checkpoint,
++    save_rank_state, mark_complete, restore_rng,
+ )
+ 
+ 
+@@ -64,6 +69,9 @@
+         help="Backend for target model: 'sglang' (service) or 'hf' (local)",
+     )
+     model_group.add_argument("--draft-config-path", type=str, default=None)
++    model_group.add_argument("--scratch", action="store_true",
++        help="Randomly initialize the regular DFlash drafter from --draft-config-path. "
++             "This changes the published initialization, not the DLoop objective.")
+     model_group.add_argument(
+         "--draft-init-path",
+         type=str,
+@@ -74,6 +82,11 @@
+     )
+     model_group.add_argument("--block-size", type=int, default=16)
+     model_group.add_argument("--num-draft-layers", type=int, default=1)
++    model_group.add_argument("--packed-token-budget", type=int, default=0,
++        help="Per-rank padded token budget for independent-document length-bucketed packing")
++    model_group.add_argument("--packing-index", type=str, default=None)
++    model_group.add_argument("--packing-bucket-width", type=int, default=128)
++    model_group.add_argument("--packing-max-records", type=int, default=128)
+     model_group.add_argument(
+         "--mask-token-id",
+         type=int,
+@@ -197,6 +210,8 @@
+ def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
+     dataset_group = parser.add_argument_group("dataset")
+     dataset_group.add_argument("--train-data-path", type=str, required=True)
++    dataset_group.add_argument("--saved-tokenized-data", action="store_true",
++        help="Read existing HF save_to_disk input_ids/loss_mask without re-tokenizing")
+     dataset_group.add_argument("--eval-data-path", type=str, default=None)
+     dataset_group.add_argument("--chat-template", type=str, default="qwen")
+     dataset_group.add_argument("--is-preformatted", action="store_true")
+@@ -225,6 +240,12 @@
+     training_group.add_argument("--accumulation-steps", type=int, default=1)
+     training_group.add_argument("--seed", type=int, default=42)
+     training_group.add_argument("--resume", action="store_true")
++    training_group.add_argument("--max-steps", type=int, default=None,
++        help="Stop after this absolute update count; preserve the full LR horizon")
++    training_group.add_argument("--activation-checkpointing", action="store_true",
++        help="Optional recomputation; same objective, different execution cost")
++    training_group.add_argument("--head-loss-chunk-size", type=int, default=0,
++        help="Checkpoint full-vocabulary CE in row chunks; 0 uses upstream dense loss")
+ 
+ 
+ def _add_output_args(parser: argparse.ArgumentParser) -> None:
+@@ -333,6 +354,8 @@
+ 
+     device = get_local_device()
+     device_type = device.type
++    if args.target_model_backend == "hf":
++        target_model_kwargs["attn_implementation"] = "sdpa"
+ 
+     draft_init_dir = None
+     if args.draft_init_path and not args.draft_config_path:
+@@ -384,6 +407,8 @@
+     draft_model = draft_cls(draft_config).to(device=device, dtype=torch.bfloat16)
+     if draft_init_dir is not None:
+         load_draft_init(draft_model, draft_init_dir)
++    if args.activation_checkpointing:
++        draft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+     if isinstance(draft_model, DSparkDraftModel):
+         # The DSpark L1 / confidence losses need the target's last hidden state.
+         if args.target_model_backend != "hf":
+@@ -407,6 +432,24 @@
+ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]:
+     """Build train and eval dataloaders."""
+     import hashlib
++
++    if args.saved_tokenized_data:
++        if args.eval_data_path:
++            raise ValueError("Separate validation is not part of this DLoop training recipe")
++        from ascend_support.tokenized_data import SavedTokenDataset
++        if args.packed_token_budget:
++            from ascend_support.packed_data import make_loader
++            loader, sampler = make_loader(args, dist.get_world_size(), dist.get_rank())
++            print_on_rank0("Packed training plan: " + json.dumps(sampler.describe()))
++            print_on_rank0(f"Up to {args.num_anchors} anchors per entire packed rank batch; documents isolated")
++            return loader, None
++        min_loss_tokens = 4 * args.block_size
++        dataset = SavedTokenDataset(args.train_data_path, args.max_length, min_loss_tokens)
++        print_on_rank0(f"Saved token data: {len(dataset)} rows; no packing or split; "
++                       f"upstream replacement policy for rows with <{min_loss_tokens} loss tokens")
++        return prepare_dp_dataloaders(dataset, args.batch_size,
++            num_workers=args.dataloader_num_workers, shuffle=True,
++            process_group=get_dp_group()), None
+ 
+     cache_params_string = (
+         f"{args.train_data_path}-"
+@@ -490,6 +533,8 @@
+         os.makedirs(save_dir, exist_ok=True)
+     dist.barrier()
+ 
++    # Persist each rank's actual master parameters and optimizer shards.
++    save_rank_state(save_dir, args, epoch, step, optimizer)
+     with FSDP.state_dict_type(dflash_model, StateDictType.FULL_STATE_DICT):
+         state_dict = dflash_model.state_dict()
+         draft_state_dict = {
+@@ -499,16 +544,6 @@
+         }
+ 
+         if dist.get_rank() == 0:
+-            torch.save(
+-                {
+-                    "epoch": epoch,
+-                    "global_step": step,
+-                    "args": args,
+-                    **optimizer.state_dict(),
+-                },
+-                os.path.join(save_dir, "training_state.pt"),
+-            )
+-
+             draft_model.save_pretrained(save_dir, state_dict=draft_state_dict)
+             write_rope_theta(os.path.join(save_dir, "config.json"))
+ 
+@@ -526,7 +561,7 @@
+ 
+             print_on_rank0(f"Saved checkpoint to {save_dir}")
+ 
+-    dist.barrier()
++    mark_complete(save_dir)
+ 
+ 
+ def record_metrics(
+@@ -571,6 +606,24 @@
+     )
+ 
+     args = parse_args()
++    if args.accumulation_steps != 1 or args.tp_size != 1:
++        raise ValueError("This port uses upstream batch accumulation=1 and target TP=1")
++    if args.scratch:
++        if args.draft_init_path or not args.draft_config_path:
++            raise ValueError("Scratch requires --draft-config-path and forbids --draft-init-path")
++    elif not args.draft_init_path:
++        raise ValueError("Set --draft-init-path, or explicitly select --scratch with --draft-config-path")
++    if args.loss_type != "dflash" or args.dloop_max_stage != 3:
++        raise ValueError("Use native DFlash CE and DLoop K=3")
++    if args.max_steps is not None and args.max_steps <= 0:
++        raise ValueError("max_steps must be positive")
++    if args.head_loss_chunk_size < 0:
++        raise ValueError("head_loss_chunk_size must be nonnegative")
++    if args.packed_token_budget:
++        if not args.saved_tokenized_data or not args.packing_index or args.packed_token_budget < args.max_length:
++            raise ValueError("Packing needs saved tokens, a matching index, and token budget >= max record length")
++        if args.batch_size != 1 or args.num_anchors < 1:
++            raise ValueError("Packing replaces batch-size=1 with dynamic batches; num-anchors must be positive")
+     set_seed(args.seed)
+ 
+     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
+@@ -592,8 +645,13 @@
+             args.draft_config_path = checkpoint_config_path
+ 
+     target_model, draft_model = build_models(args)
++    if args.packed_token_budget:
++        from ascend_support.packed_target import enable_hidden_only_target
++        enable_hidden_only_target(target_model)
++        print_on_rank0("Packed teacher: original Qwen3 backbone, unused vocabulary logits skipped")
+ 
+     resume_state = None
++    pending_rng = None
+     if draft_model_last_checkpoint:
+         loaded_model = DFlashDraftModel.from_pretrained(
+             draft_model_last_checkpoint, torch_dtype=torch.bfloat16
+@@ -603,12 +661,15 @@
+         print("Loaded draft model weights from checkpoint")
+ 
+         training_state_path = os.path.join(
+-            draft_model_last_checkpoint, "training_state.pt"
++            draft_model_last_checkpoint, f"training_state_rank{dist.get_rank()}.pt"
+         )
+         if os.path.exists(training_state_path):
+             resume_state = torch.load(
+                 training_state_path, map_location="cpu", weights_only=False
+             )
++            if resume_state["world_size"] != dist.get_world_size():
++                raise ValueError("Resume requires the same world size")
++            pending_rng = resume_state["rng"]
+             print(
+                 f"Will resume from epoch {resume_state['epoch']}, "
+                 f"step {resume_state['global_step']}"
+@@ -678,6 +739,15 @@
+             loop_max_stage=args.dloop_max_stage,
+         )
+ 
++    if args.head_loss_chunk_size:
++        from ascend_support.chunked_ce import enable_chunked_ce
++        enable_chunked_ce(dflash_model, args.head_loss_chunk_size)
++        print_on_rank0(f"Full-vocabulary CE: {args.head_loss_chunk_size} prediction rows/chunk, checkpointed")
++    if args.packed_token_budget:
++        from ascend_support.packed_objective import enable_packed_sampling, set_packed_step
++        enable_packed_sampling(dflash_model, args.seed)
++    unwrapped_dflash_model = dflash_model
++
+     # Wrap each transformer block as its own FSDP unit so that all-gather /
+     # reduce-scatter overlap with compute. Without an auto_wrap_policy the
+     # whole model is a single FSDP unit, forcing every collective onto the
+@@ -686,6 +756,7 @@
+     # rather than hardcoding a specific decoder-layer class.
+     fsdp_kwargs = dict(
+         use_orig_params=True,
++        device_id=device,
+         forward_prefetch=True,
+         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+         limit_all_gathers=True,
+@@ -744,7 +815,8 @@
+     print_on_rank0(f"Starting training from epoch {start_epoch}, step {global_step}")
+ 
+     for epoch in range(start_epoch, args.num_epochs):
+-        train_dataloader.sampler.set_epoch(epoch)
++        epoch_sampler = train_dataloader.batch_sampler if args.packed_token_budget else train_dataloader.sampler
++        epoch_sampler.set_epoch(epoch)
+         draft_model.train()
+ 
+         if dist.get_rank() == 0:
+@@ -757,17 +829,28 @@
+         for step_in_epoch, data in enumerate(progress_bar):
+             if epoch == start_epoch and step_in_epoch < skip_steps:
+                 continue
++            if pending_rng is not None:
++                # Iterator creation consumes CPU RNG; restore after skipping rows.
++                restore_rng(pending_rng)
++                pending_rng = None
+             global_step += 1
++            update_started = time.perf_counter()
++            if args.packed_token_budget:
++                set_packed_step(unwrapped_dflash_model, data["lengths"], global_step)
+ 
+             input_ids = data["input_ids"].to(device, non_blocking=True)
+             attention_mask = data["attention_mask"].to(device, non_blocking=True)
+             loss_mask = data["loss_mask"].to(device, non_blocking=True)
+             position_offsets = None
+             if args.position_offset_max > 0:
+-                hi = max(args.position_offset_max - input_ids.shape[1] + 1, 1)
+-                position_offsets = torch.randint(
+-                    0, hi, (input_ids.shape[0],), device=device
+-                )
++                if args.packed_token_budget:
++                    hi = (args.position_offset_max - data["lengths"].to(device) + 1).clamp(min=1)
++                    position_offsets = (torch.rand(input_ids.shape[0], device=device) * hi).long()
++                else:
++                    hi = max(args.position_offset_max - input_ids.shape[1] + 1, 1)
++                    position_offsets = torch.randint(
++                        0, hi, (input_ids.shape[0],), device=device
++                    )
+             target_output = target_model.generate_dflash_data(
+                 input_ids, attention_mask, loss_mask, position_offsets=position_offsets
+             )
+@@ -820,13 +903,32 @@
+                 )
+ 
+             if dist.get_rank() == 0:
+-                elapsed = time.time() - last_time
+-                last_time = time.time()
++                # Measure after device completion, including loss.item() waits.
++                if device.type == "npu":
++                    torch.npu.synchronize()
++                elif device.type == "cuda":
++                    torch.cuda.synchronize()
++                loss_value, accuracy_value = loss.item(), accuracy.item()
++                elapsed = time.perf_counter() - update_started
++                extra_postfix = {}
++                if args.packed_token_budget:
++                    extra_postfix = {"docs":len(data["lengths"]),
++                        "tokens":int(data["lengths"].sum()),
++                        "anchors":unwrapped_dflash_model._packed_sampled_anchors}
++                    if global_step % args.log_interval == 0:
++                        timing = dict(step=global_step, total_steps=total_steps,
++                            seconds=elapsed, loss=loss_value, accuracy=accuracy_value,
++                            rank=0, **extra_postfix,
++                            padded_tokens=int(data["input_ids"].numel()),
++                            allocated_anchor_slots=unwrapped_dflash_model._packed_allocated_anchor_slots)
++                        with open(os.path.join(args.output_dir, "packed_metrics.jsonl"), "a") as f:
++                            f.write(json.dumps(timing) + "\n")
+                 progress_bar.set_postfix(
+                     {
+-                        "loss": f"{loss.item():.4f}",
+-                        "acc": f"{accuracy.item():.4f}",
++                        "loss": f"{loss_value:.4f}",
++                        "acc": f"{accuracy_value:.4f}",
+                         "iter_time": f"{elapsed:.2f}s",
++                        **extra_postfix,
+                     }
+                 )
+ 
+@@ -835,6 +937,13 @@
+                     args, epoch, global_step, dflash_model, draft_model, optimizer
+                 )
+ 
++            if args.max_steps is not None and global_step >= args.max_steps:
++                if global_step % args.save_interval != 0:
++                    save_checkpoint(args, epoch, global_step, dflash_model, draft_model, optimizer)
++                tracker.close()
++                destroy_distributed()
++                return
++
+     save_checkpoint(
+         args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
+     )
+--- a/specforge/__init__.py
++++ b/specforge/__init__.py
+@@ -1,7 +1,2 @@
+-# Derived from SpecForge (https://github.com/sgl-project/SpecForge)
+-# MIT License
+-
+-from .core import *  # noqa
+-from .modeling import *  # noqa
+-
+-__all__ = ["modeling", "core"]
++# Derived from NAVER DLoop / SpecForge; original license headers are in adjacent modules.
++# Ascend portability: import explicit submodules instead of unrelated CUDA/SP stacks.
+--- a/specforge/core/__init__.py
++++ b/specforge/core/__init__.py
+@@ -1,14 +1,2 @@
+-# Derived from SpecForge (https://github.com/sgl-project/SpecForge)
+-# MIT License
+-# Modified for DLoop
+-
+-from .dflash import OnlineDFlashModel, OnlineDominoModel, OnlineDSparkModel
+-from .eagle3 import OnlineEagle3Model, QwenVLOnlineEagle3Model
+-
+-__all__ = [
+-    "OnlineDFlashModel",
+-    "OnlineDominoModel",
+-    "OnlineDSparkModel",
+-    "OnlineEagle3Model",
+-    "QwenVLOnlineEagle3Model",
+-]
++# Derived from NAVER DLoop / SpecForge; original license headers are in adjacent modules.
++# Ascend portability: import explicit submodules instead of unrelated CUDA/SP stacks.
+--- a/specforge/distributed.py
++++ b/specforge/distributed.py
+@@ -6,9 +6,9 @@
+ 
+ import torch
+ import torch.distributed as dist
+-from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
+-
+-from specforge.utils import print_with_rank
++import os
++
++from specforge.utils import print_with_rank, get_device_type
+ 
+ _DEVICE_MESH = None
+ _TP_DEVICE_MESH = None
+@@ -75,9 +75,18 @@
+         timeout(int): Timeout for collective communication in minutes
+         tp_size(int): The degree of tensor parallelism
+     """
+-    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=timeout))
+-    local_rank = dist.get_rank() % torch.cuda.device_count()
+-    torch.cuda.set_device(local_rank)
++    device_type = get_device_type()
++    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
++    if device_type == "npu":
++        import torch_npu
++        torch.npu.set_device(local_rank)
++        backend = "hccl"
++    elif device_type == "cuda":
++        torch.cuda.set_device(local_rank)
++        backend = "nccl"
++    else:
++        backend = "gloo"
++    dist.init_process_group(backend=backend, timeout=timedelta(minutes=timeout))
+     print_with_rank(f"bind to device {local_rank}")
+ 
+     world_size = dist.get_world_size()
+@@ -87,7 +96,7 @@
+     ), f"world size must be divisible by tp size, now {world_size=}, {(tp_size * dp_size)=} "
+ 
+     device_mesh = dist.device_mesh.init_device_mesh(
+-        "cuda", (dp_size, tp_size), mesh_dim_names=("dp", "tp")
++        device_type, (dp_size, tp_size), mesh_dim_names=("dp", "tp")
+     )
+ 
+     assert (
+@@ -96,20 +105,30 @@
+ 
+     draft_dp_size = world_size // (sp_ulysses_size * sp_ring_size)
+     draft_device_mesh = dist.device_mesh.init_device_mesh(
+-        "cuda",
++        device_type,
+         (draft_dp_size, sp_ulysses_size * sp_ring_size),
+         mesh_dim_names=("draft_dp", "sp"),
+     )
+-    set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
+ 
+     print_with_rank(f"device mesh: {device_mesh}")
+     tp_group = device_mesh.get_group("tp")
+     dp_group = device_mesh.get_group("dp")
+ 
+-    sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
+-    sp_ring_group = PROCESS_GROUP.RING_PG
++    if sp_ulysses_size == 1 and sp_ring_size == 1:
++        # The DFlash recipe uses no sequence parallelism. Keep local singleton
++        # groups for its collator without importing CUDA-only yunchang kernels.
++        sp_ulysses_group = sp_ring_group = None
++        for rank in range(world_size):
++            group = dist.new_group([rank])
++            if rank == dist.get_rank():
++                sp_ulysses_group = sp_ring_group = group
++    else:
++        from yunchang.globals import PROCESS_GROUP, set_seq_parallel_pg
++        set_seq_parallel_pg(sp_ulysses_size, sp_ring_size, dist.get_rank(), world_size)
++        sp_ulysses_group = PROCESS_GROUP.ULYSSES_PG
++        sp_ring_group = PROCESS_GROUP.RING_PG
+     # we need to create a 1D submesh
+-    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type="cuda")
++    tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type=device_type)
+ 
+     global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+     _DEVICE_MESH = device_mesh
+@@ -120,7 +139,7 @@
+     _DP_GROUP = dp_group
+     _DRAFT_DP_GROUP = draft_device_mesh.get_group("draft_dp")
+     _DRAFT_SP_GROUP = draft_device_mesh.get_group("sp")
+-    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type="cuda")
++    _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type=device_type)
+ 
+ 
+ def destroy_distributed():
+--- a/specforge/modeling/__init__.py
++++ b/specforge/modeling/__init__.py
+@@ -1,30 +1,2 @@
+-# Derived from SpecForge (https://github.com/sgl-project/SpecForge)
+-# MIT License
+-# Modified for DLoop
+-
+-from .auto import AutoDraftModelConfig, AutoEagle3DraftModel
+-from .draft.llama3_eagle import LlamaForCausalLMEagle3
+-from .target import (
+-    Eagle3TargetEngine,
+-    HFEagle3TargetEngine,
+-    HFEagle3TargetModel,
+-    SGLangEagle3TargetEngine,
+-    SGLangEagle3TargetModel,
+-    TargetEngine,
+-    get_eagle3_target_model,
+-)
+-
+-__all__ = [
+-    "LlamaForCausalLMEagle3",
+-    # Generic (Phase B) surface
+-    "TargetEngine",
+-    "Eagle3TargetEngine",
+-    "SGLangEagle3TargetEngine",
+-    "HFEagle3TargetEngine",
+-    "get_eagle3_target_model",
+-    # Back-compat aliases (pre-Phase-B names)
+-    "SGLangEagle3TargetModel",
+-    "HFEagle3TargetModel",
+-    "AutoDraftModelConfig",
+-    "AutoEagle3DraftModel",
+-]
++# Derived from NAVER DLoop / SpecForge; original license headers are in adjacent modules.
++# Ascend portability: import explicit submodules instead of unrelated CUDA/SP stacks.
+--- a/specforge/modeling/draft/__init__.py
++++ b/specforge/modeling/draft/__init__.py
+@@ -1,30 +1,2 @@
+-# Derived from SpecForge (https://github.com/sgl-project/SpecForge)
+-# MIT License
+-# Modified for DLoop
+-
+-from .base import Eagle3DraftModel
+-from .dflash import (
+-    DFlashDraftModel,
+-    build_target_layer_ids,
+-    extract_context_feature,
+-    sample,
+-)
+-from .domino import DominoDraftModel
+-from .dspark import DSparkDraftModel
+-from .llama3_eagle import LlamaForCausalLMEagle3
+-from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_draft
+-
+-__all__ = [
+-    "Eagle3DraftModel",
+-    "DFlashDraftModel",
+-    "DominoDraftModel",
+-    "DSparkDraftModel",
+-    "LlamaForCausalLMEagle3",
+-    "build_target_layer_ids",
+-    "extract_context_feature",
+-    "sample",
+-    "DRAFT_REGISTRY",
+-    "register_draft",
+-    "resolve_draft",
+-    "available_drafts",
+-]
++# Derived from NAVER DLoop / SpecForge; original license headers are in adjacent modules.
++# Ascend portability: import explicit submodules instead of unrelated CUDA/SP stacks.
+--- a/specforge/modeling/target/__init__.py
++++ b/specforge/modeling/target/__init__.py
+@@ -1,39 +1,2 @@
+-# Derived from SpecForge (https://github.com/sgl-project/SpecForge)
+-# MIT License
+-# Modified for DLoop
+-
+-from specforge.inference.target_engine.base import KNOWN_BACKENDS, TargetEngine
+-from specforge.inference.target_engine.eagle3_target_model import (
+-    Eagle3TargetEngine,
+-    Eagle3TargetModel,
+-    HFEagle3TargetEngine,
+-    HFEagle3TargetModel,
+-    SGLangEagle3TargetEngine,
+-    SGLangEagle3TargetModel,
+-    SGLangServerEagle3TargetEngine,
+-    get_eagle3_target_model,
+-)
+-
+-from .target_head import TargetHead
+-
+-__all__ = [
+-    # Generic (Phase B) surface
+-    "TargetEngine",
+-    "KNOWN_BACKENDS",
+-    # EAGLE3 engines
+-    "Eagle3TargetEngine",
+-    "SGLangEagle3TargetEngine",
+-    "HFEagle3TargetEngine",
+-    "SGLangServerEagle3TargetEngine",
+-    "get_eagle3_target_model",
+-    # Back-compat aliases (pre-Phase-B names)
+-    "Eagle3TargetModel",
+-    "SGLangEagle3TargetModel",
+-    "HFEagle3TargetModel",
+-    "TargetHead",
+-]
+-
+-# NOTE: the DFlash engines are intentionally NOT eagerly imported here — that
+-# module imports sglang internals unconditionally, and this package must stay
+-# importable without the pinned sglang. Import them from
+-# specforge.inference.target_engine.dflash_target_model.
++# Derived from NAVER DLoop / SpecForge; original license headers are in adjacent modules.
++# Ascend portability: import explicit submodules instead of unrelated CUDA/SP stacks.

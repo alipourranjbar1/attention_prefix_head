@@ -1,0 +1,18 @@
+{
+  "mine": {
+    "commit": "0dfde646279db713409caf42e7fe4697c2a9e754",
+    "url": "https://github.com/alipourranjbar1/attention_prefix_head.git"
+  },
+  "dloop_port": {
+    "commit": "cb33529a0d6ac647cfab9386bc3a3f365300e34c",
+    "url": "https://github.com/alipourranjbar1/attention_prefix_head.git"
+  },
+  "official": {
+    "commit": "775dedd71aa95e1d98e6780efe5c444a2a27575c",
+    "url": "https://github.com/naver-ai/DLoop.git"
+  },
+  "speculators": {
+    "commit": "89b5caa300f473c1e3127497e6f594ba024057d5",
+    "url": "https://github.com/MohammadMahdi1375/speculators.git"
+  }
+}
